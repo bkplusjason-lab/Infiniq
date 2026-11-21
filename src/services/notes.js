@@ -42,7 +42,7 @@ const GUIDES = {
 
 export const notesAvailable = () => config.claude.enabled;
 
-export async function generateNotes(rec, segments, speakers, bookmarks) {
+export async function generateNotes(rec, segments, speakers, bookmarks, { outputLanguage } = {}) {
   const name = (id) => speakers[id]?.name || `Speaker ${id ?? '?'}`;
   const transcript = segments.map((s) => `[${fmt(s.start)}] ${name(s.speaker)}: ${s.text}`).join('\n');
   if (!transcript.trim()) throw Object.assign(new Error('There is no transcript to summarise yet.'), { status: 400 });
@@ -54,7 +54,7 @@ Rules:
 - Only use information present in the transcript; never invent names, numbers, dates or scripture references.
 - Keep timestamps in [m:ss] or [h:mm:ss] form so the reader can jump to that moment.
 - Refer to people by the speaker names given. The transcript may contain recognition errors; silently fix obvious ones, and mark genuinely unclear passages with "(unclear)".
-- Write in the same language as the transcript.
+- ${outputLanguage ? `Write the notes in ${outputLanguage}, translating from the transcript's language. Keep names and scripture references accurate, and quote short key phrases in the original language in brackets where nuance matters.` : 'Write in the same language as the transcript.'}
 - Output only the Markdown notes, starting with a level-1 heading that is a good title.`;
 
   const stream = getClient().beta.messages.stream({

@@ -48,6 +48,16 @@ export const config = {
     assemblyKey: env('ASSEMBLYAI_API_KEY'),
     deepgramKey: env('DEEPGRAM_API_KEY'),
   },
+  billing: {
+    // Lets users switch paid add-ons on/off without paying, for testing. Never enable in production.
+    testMode: env('BILLING_TEST_MODE', isProd ? 'false' : 'true') === 'true',
+    translationPrice: env('TRANSLATION_PRICE_LABEL', 'US$4.99 / month'),
+  },
+  translation: {
+    // claude | mock ("mock" returns labelled demo text so the flow can be tested without an AI key)
+    provider: env('TRANSLATION_PROVIDER') || ((env('ANTHROPIC_API_KEY') || env('ANTHROPIC_AUTH_TOKEN')) ? 'claude' : (isProd ? '' : 'mock')),
+    model: env('CLAUDE_TRANSLATE_MODEL', env('CLAUDE_MODEL', 'claude-opus-5-5')),
+  },
   claude: { enabled: !!(env('ANTHROPIC_API_KEY') || env('ANTHROPIC_AUTH_TOKEN')), model: env('CLAUDE_MODEL', 'claude-opus-5-5') },
 };
 

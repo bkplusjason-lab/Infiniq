@@ -71,5 +71,32 @@ CREATE TABLE IF NOT EXISTS recordings (
 CREATE INDEX IF NOT EXISTS idx_rec_user ON recordings(user_id, created_at DESC);
 `);
 
+
+// ---- migrations for databases created by earlier versions ----
+const cols = (t) => db.prepare(`PRAGMA table_info(${t})`).all().map((c) => c.name);
+if (!cols('users').includes('preferred_lang')) db.exec("ALTER TABLE users ADD COLUMN preferred_lang TEXT NOT NULL DEFAULT 'en'");
+if (!cols('users').includes('addons')) db.exec("ALTER TABLE users ADD COLUMN addons TEXT NOT NULL DEFAULT ''");
+db.exec(`
+CREATE TABLE IF NOT EXISTS translations (
+  recording_id TEXT NOT NULL REFERENCES recordings(id) ON DELETE CASCADE,
+  lang TEXT NOT NULL,
+  source_hash TEXT,
+  segments_json TEXT,
+  ai_notes_md TEXT,
+  my_notes_md TEXT,
+  origin TEXT,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (recording_id, lang)
+);
+CREATE TABLE IF NOT EXISTS billing_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  type TEXT NOT NULL,
+  addon TEXT,
+  test INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL
+);
+`);
+
 export const now = () => Date.now();
 export const newId = () => crypto.randomUUID();

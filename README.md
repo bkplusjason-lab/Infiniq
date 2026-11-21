@@ -19,6 +19,7 @@ Infiniq is a web app that records sermons, lectures and meetings, transcribes th
 | **AI notes** (Claude) | Sermons: scriptures, main points, quotes, application, prayer points. Lectures: key concepts, detailed notes, review questions. Meetings: attendees, decisions, and an action-item table with owners. |
 | **Library** | Search across titles, transcripts and notes. Filter by type, add tags, and see usage stats. |
 | **Export** | Markdown, text, SRT/VTT subtitles, the original audio, Print or Save as PDF, and Share (on phones). |
+| **🌐 Live Translation** (paid add-on) | Captions translated in real time while recording, plus a stand-alone **Live translate** screen. That screen has a *Listen* mode for sermons, lectures and music, and a two-way *Conversation* interpreter with read-aloud. You can also translate saved transcripts into 30+ languages, have sermon notes and meeting minutes written directly in your preferred language, translate your own notes, and export translated transcripts and subtitles. |
 | **Account** | Edit your profile, see your plan and usage, sign out, and permanently delete your account and data. |
 | **Installable** | Can be added to a phone's home screen (PWA manifest). Light and dark mode. |
 
@@ -36,6 +37,16 @@ npm start                 # http://localhost:3000
 
 Without a transcription key, the transcript comes from the browser's live captions. Speakers are then grouped by voice pitch, which is approximate.
 
+### Testing the paid Live Translation add-on
+
+1. Sign in, then open **Account → Plans & add-ons** (or the 🌐 Translate tab). Free users see an "Unlock" card, and the server refuses translation requests from them.
+2. In test mode (the default outside production), click **Activate (test mode – free)**. No payment is taken.
+3. Set **Account → Preferred language** (e.g. English).
+4. Try **🌐 Translate → Listen**: choose 日本語 Japanese → English and speak or play Japanese audio near the mic. **Conversation** mode has "They speak" and "I speak" buttons and can read translations aloud.
+5. Try **Record** with "Translate live to" ticked, then open the recording's **🌐 Translate** tab. From there you can make notes or minutes in your language, translate your own notes, or export the translation.
+
+Without `ANTHROPIC_API_KEY`, translations are labelled demo text such as "[English – demo] …". This lets you test every screen and the paywall for free. Add the key for real translations.
+
 ### Tests
 
 ```bash
@@ -52,7 +63,8 @@ npm run test:e2e  # real browser: sign in → record from a simulated mic → ch
 | WhatsApp codes | Meta WhatsApp Business Platform (Cloud API). Create an **Authentication** message template, e.g. `otp_code`, and get it approved. | `WHATSAPP_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID`, `WHATSAPP_TEMPLATE_NAME` |
 | Official emails | Any SMTP service: Google Workspace, SendGrid, Mailgun, Amazon SES, and others. Send from your own domain with SPF/DKIM set up so emails don't land in spam. | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `MAIL_FROM` |
 | Speaker detection | AssemblyAI **or** Deepgram API key | `ASSEMBLYAI_API_KEY` or `DEEPGRAM_API_KEY` |
-| AI notes | console.anthropic.com | `ANTHROPIC_API_KEY` |
+| AI notes + translation | console.anthropic.com | `ANTHROPIC_API_KEY` (optional: `CLAUDE_TRANSLATE_MODEL` for a faster live-caption model) |
+| Paid add-on | Set your price and turn off test mode once real payments are connected | `TRANSLATION_PRICE_LABEL`, `BILLING_TEST_MODE=false` |
 
 Also set `NODE_ENV=production`, `APP_URL=https://your-domain`, and a long random `SESSION_SECRET`. Serve the site over **HTTPS**, because browsers only allow microphone access on secure sites.
 
@@ -64,11 +76,13 @@ Also set `NODE_ENV=production`, `APP_URL=https://your-domain`, and a long random
 public/            Front end (plain HTML/CSS/JS, no build step)
   app.js           Screens: login, code entry, library, recorder, recording page, account
   recorder.js      Microphone, live captions, pitch tracking, backup on the device
+  translate.js     Live Translation: language lists, live caption translator, conversation listener
   pitch.js         Voice pitch detection (YIN algorithm), used for the male/female estimate
 src/
   server.js        Express server, security headers, CSRF check
   routes/auth.js   Google / Facebook / WhatsApp sign-in, codes, adding an email
   routes/recordings.js  Upload, transcript, speakers, notes, export, account
+  routes/translate.js   Paid add-on: plans (test mode), live translation, transcript/notes translation
   services/        Email, WhatsApp, transcription (AssemblyAI/Deepgram), voices, AI notes (Claude)
 data/              SQLite database + audio files (created automatically, not committed)
 ```
@@ -79,13 +93,13 @@ data/              SQLite database + audio files (created automatically, not com
 
 ## Features you could add next
 
-1. **Subscriptions.** Use Stripe Billing with plans based on minutes or storage. Each account already has a `plan` field, and usage (minutes and storage) is already tracked.
+1. **Subscriptions.** Use Stripe Checkout and Billing. The add-on system is ready: a Stripe webhook only needs to call `setAddon(userId, 'translation', true/false)` in `src/routes/translate.js`, and every billing change is already logged in `billing_events`.
 2. **Speaker voice profiles.** Remember "Pastor John's voice" so he is named automatically in future recordings.
 3. **Ask your recordings.** For example, "What did the pastor say about forgiveness last month?", answered by Claude across your library.
 4. **Shared workspaces.** A church, school or company team shares recordings and minutes, with roles for admin, editor and viewer.
 5. **Email minutes to attendees** with one tap, and send action-item reminders.
 6. **Calendar integration.** Name and tag meeting recordings automatically from Google or Outlook calendar events.
-7. **Translation.** Read a sermon or lecture transcript in another language, which helps multilingual congregations.
+7. **Faster live translation.** Server-side streaming speech recognition (e.g. Deepgram live) would add Firefox support and translate mid-sentence. Text-to-speech in a natural voice could serve as a "church headset" interpretation channel that many listeners join with a QR code.
 8. **Scripture lookup.** Link the Bible references found in sermons to the verse text.
 9. **Highlight clips.** Share a 30-second audio clip with its caption on social media or WhatsApp.
 10. **Offline mode.** Record with no internet connection and upload automatically when the connection returns.

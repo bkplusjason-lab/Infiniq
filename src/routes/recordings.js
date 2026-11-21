@@ -8,6 +8,8 @@ import { SESSION_COOKIE, loadSession, getUser, publicUser, destroySession } from
 import { buildSpeakers, clusterSpeakersByPitch } from '../services/voices.js';
 import { transcribeFile, transcriptionAvailable } from '../services/transcribe.js';
 import { generateNotes, notesAvailable } from '../services/notes.js';
+import { saveLiveTranslation } from './translate.js';
+import { LANG_RE, sourceHash } from '../services/translate.js';
 
 export const recRouter = Router();
 const KINDS = ['sermon', 'lecture', 'meeting', 'other'];
@@ -102,6 +104,11 @@ recRouter.get('/api/me', (req, res) => {
 recRouter.patch('/api/me', (req, res) => {
   const name = clean(req.body?.name, 100).trim();
   if (name) db.prepare('UPDATE users SET name = ? WHERE id = ?').run(name, req.user.id);
+  const lang = req.body?.preferredLang;
+  if (lang !== undefined) {
+    if (!LANG_RE.test(String(lang))) return res.status(400).json({ error: 'Unknown language' });
+    db.prepare('UPDATE users SET preferred_lang = ? WHERE id = ?').run(lang, req.user.id);
+  }
   res.json({ user: publicUser(getUser(req.user.id)) });
 });
 recRouter.delete('/api/me', (req, res) => {
@@ -149,6 +156,7 @@ recRouter.post('/api/recordings', upload.single('audio'), async (req, res) => {
       Number(b.durationSec) || null, willTranscribe ? 'transcribing' : 'ready', segments.length ? 'browser' : null,
       JSON.stringify(segments), JSON.stringify(speakers), pitch ? JSON.stringify(pitch) : null, JSON.stringify(bookmarks),
       clean(b.notes, 200000), now(), now());
+  saveLiveTranslation(req.user, id, segments, parse(b.liveTranslation, null));
   if (willTranscribe) runTranscription(id);
   res.status(201).json({ recording: view(db.prepare('SELECT * FROM recordings WHERE id = ?').get(id), true) });
 });
@@ -239,25 +247,37 @@ const short = (t) => { const s = Math.floor(t); const h = Math.floor(s / 3600); 
 recRouter.get('/api/recordings/:id/export', (req, res) => {
   const r = getOwned(req);
   if (!r) return res.status(404).end();
-  const segs = parse(r.segments_json, []), sp = parse(r.speakers_json, {});
+  let segs = parse(r.segments_json, []);
+  const sp = parse(r.speakers_json, {});
   const who = (id) => sp[id]?.name || 'Speaker';
+  let title = r.title, aiNotes = r.ai_notes_md, myNotes = r.notes_md;
+  // ?lang=xx exports the translated version (Live Translation add-on)
+  if (req.query.lang && LANG_RE.test(String(req.query.lang))) {
+    if (!(req.user.addons || '').split(',').includes('translation')) return res.status(402).json({ error: 'Translated exports need the Live Translation add-on.', code: 'upgrade_required' });
+    const t = db.prepare('SELECT * FROM translations WHERE recording_id = ? AND lang = ?').get(r.id, req.query.lang);
+    if (!t) return res.status(404).json({ error: 'No translation in that language yet.' });
+    const tr = parse(t.segments_json, null);
+    if (tr && t.source_hash === sourceHash(segs)) segs = segs.map((s, i) => ({ ...s, text: tr[i] || s.text }));
+    else if (tr) segs = [];
+    title = `${r.title} (${req.query.lang})`; aiNotes = t.ai_notes_md; myNotes = t.my_notes_md;
+  }
   const fmt = ['txt', 'md', 'srt', 'vtt'].includes(req.query.format) ? req.query.format : 'txt';
   const date = new Date(r.created_at).toLocaleString('en-GB');
   let out;
   if (fmt === 'srt') out = segs.map((s, i) => `${i + 1}\n${ts(s.start, ',')} --> ${ts(s.end, ',')}\n${who(s.speaker)}: ${s.text}\n`).join('\n');
   else if (fmt === 'vtt') out = 'WEBVTT\n\n' + segs.map((s) => `${ts(s.start)} --> ${ts(s.end)}\n<v ${who(s.speaker)}>${s.text}\n`).join('\n');
   else if (fmt === 'md') {
-    out = `# ${r.title}\n\n*${r.kind} · ${date}*\n\n`;
-    if (r.ai_notes_md) out += `${r.ai_notes_md}\n\n---\n\n`;
-    if (r.notes_md) out += `## My notes\n\n${r.notes_md}\n\n`;
+    out = `# ${title}\n\n*${r.kind} · ${date}*\n\n`;
+    if (aiNotes) out += `${aiNotes}\n\n---\n\n`;
+    if (myNotes) out += `## My notes\n\n${myNotes}\n\n`;
     out += `## Transcript\n\n` + segs.map((s) => `**[${short(s.start)}] ${who(s.speaker)}:** ${s.text}`).join('\n\n') + '\n';
   } else {
-    out = `${r.title}\n${r.kind} - ${date}\n\n`;
-    if (r.notes_md) out += `MY NOTES\n${r.notes_md}\n\n`;
-    if (r.ai_notes_md) out += `AI NOTES\n${r.ai_notes_md}\n\n`;
+    out = `${title}\n${r.kind} - ${date}\n\n`;
+    if (myNotes) out += `MY NOTES\n${myNotes}\n\n`;
+    if (aiNotes) out += `AI NOTES\n${aiNotes}\n\n`;
     out += 'TRANSCRIPT\n' + segs.map((s) => `[${short(s.start)}] ${who(s.speaker)}: ${s.text}`).join('\n') + '\n';
   }
-  const name = r.title.replace(/[^\w\- ]+/g, '').trim().slice(0, 60) || 'recording';
+  const name = title.replace(/[^\w\- ]+/g, '').trim().slice(0, 60) || 'recording';
   res.setHeader('Content-Disposition', `attachment; filename="${name}.${fmt}"`);
   res.type(fmt === 'md' ? 'text/markdown' : fmt === 'vtt' ? 'text/vtt' : 'text/plain').send(out);
 });

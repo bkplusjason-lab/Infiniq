@@ -18,12 +18,18 @@ export function cookieOptions(maxAgeMs) {
 }
 
 // ---------- users ----------
+export const addonsOf = (u) => (u?.addons || '').split(',').filter(Boolean);
+export const hasAddon = (u, addon) => addonsOf(u).includes(addon);
+
 export const getUser = (id) => db.prepare('SELECT * FROM users WHERE id = ?').get(id);
 
 export function publicUser(u) {
   if (!u) return null;
   const ids = db.prepare('SELECT provider FROM identities WHERE user_id = ?').all(u.id).map((r) => r.provider);
-  return { id: u.id, name: u.name, email: u.email, phone: u.phone, avatarUrl: u.avatar_url, plan: u.plan, providers: ids, createdAt: u.created_at };
+  return {
+    id: u.id, name: u.name, email: u.email, phone: u.phone, avatarUrl: u.avatar_url, plan: u.plan, providers: ids,
+    createdAt: u.created_at, preferredLang: u.preferred_lang || 'en', addons: addonsOf(u),
+  };
 }
 
 /**

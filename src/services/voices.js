@@ -55,7 +55,7 @@ export function buildSpeakers(segments, pitch, existing = {}) {
     const values = segments.filter((s) => s.speaker === id).flatMap((s) => voicedPitchIn(pitch, s.start, s.end));
     const est = classifyVoice(values);
     const prev = existing[id] || {};
-    const label = /^\d+$/.test(id) ? id : id === 'U' ? '?' : String(idx + 1);
+    const label = /^\d+$/.test(id) ? id : id === 'U' ? '1' : String(idx + 1);
     out[id] = {
       name: prev.name || `Speaker ${label}`,
       voice: prev.manualVoice ? prev.voice : est.voice,

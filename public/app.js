@@ -1,6 +1,7 @@
 import { Recorder, backup, liveCaptionsSupported, recordingSupported } from './recorder.js';
 import { analyseFile } from './pitch.js';
 import { renderMarkdown } from './markdown.js';
+import { TARGET_LANGS, SPOKEN_LANGS, langLabel, baseLang, spokenFor, LiveTranslator, Listener, speak, speechSupported } from './translate.js';
 
 // ---------------- helpers ----------------
 const $ = (s, el = document) => el.querySelector(s);
@@ -9,9 +10,7 @@ const main = $('#main');
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const KINDS = { sermon: 'Sermon', lecture: 'Lecture', meeting: 'Meeting minutes', other: 'Other' };
 const VOICES = { male: 'Male voice', female: 'Female voice', unknown: 'Voice not detected' };
-const LANGS = [['en-US', 'English (US)'], ['en-GB', 'English (UK)'], ['en-SG', 'English (Singapore)'], ['en-AU', 'English (Australia)'], ['en-IN', 'English (India)'],
-  ['zh-CN', '中文 (普通话)'], ['zh-TW', '中文 (台灣)'], ['ms-MY', 'Bahasa Melayu'], ['id-ID', 'Bahasa Indonesia'], ['ta-IN', 'தமிழ்'], ['hi-IN', 'हिन्दी'],
-  ['es-ES', 'Español'], ['fr-FR', 'Français'], ['de-DE', 'Deutsch'], ['pt-BR', 'Português'], ['ko-KR', '한국어'], ['ja-JP', '日本語'], ['tl-PH', 'Filipino']];
+const LANGS = SPOKEN_LANGS;
 
 export function fmtTime(t) {
   const s = Math.max(0, Math.floor(t || 0)), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
@@ -53,6 +52,22 @@ function uploadWithProgress(form, onProgress) {
 }
 
 const state = { config: null, auth: null, recorder: null };
+const me = () => state.auth?.user || {};
+const langName = (code) => { try { return new Intl.DisplayNames([navigator.language || 'en'], { type: 'language' }).of(code); } catch { return code; } };
+const hasTranslation = () => (me().addons || []).includes('translation');
+const langOptions = (sel) => TARGET_LANGS.map(([c, n]) => `<option value="${c}" ${c === sel ? 'selected' : ''}>${esc(n)}</option>`).join('');
+async function refreshMe() { const { user } = await api('/api/me'); state.auth = { ...state.auth, user }; return user; }
+
+/** Upsell card for the paid Live Translation add-on. */
+function upsellHtml(compact = false) {
+  return `<div class="card upsell stack">
+    <div class="row"><span class="badge-pro">PRO</span><h2 style="margin:0">🌐 Live Translation</h2></div>
+    <p>Understand every sermon, lecture and meeting in your own language, as it happens.</p>
+    ${compact ? '' : `<ul class="ticks"><li>Real-time translated captions while recording</li><li>Two-way conversation interpreter with read-aloud</li>
+      <li>Translate full transcripts into 30+ languages</li><li>Notes and meeting minutes written in your preferred language</li><li>Translated exports and subtitles</li></ul>`}
+    <a class="btn primary" href="#/plans">See plan &amp; unlock</a>
+  </div>`;
+}
 const go = (hash) => { if (location.hash !== hash) location.hash = hash; else route(); };
 
 // ---------------- icons ----------------
@@ -70,6 +85,7 @@ async function route() {
   if (!state.config) state.config = await api('/api/config');
   if (!state.auth || ['/login', '/otp'].includes(path)) state.auth = await api('/api/auth/status');
 
+  if (state.listener) { state.listener.stop(); state.listener = null; }
   if (state.recorder && state.recorder.state !== 'stopped' && path !== '/record') {
     if (!confirm('A recording is in progress. Leave this page and discard it?')) { history.back(); return; }
     state.recorder.cancel(); state.recorder = null;
@@ -84,13 +100,15 @@ async function route() {
 
   const signedIn = a === 'signed_in';
   $('#topbar').hidden = !signedIn;
-  $$('.nav a').forEach((l) => l.classList.toggle('active', l.dataset.nav === ({ '/': 'library', '/record': 'record', '/account': 'account' }[path] || (path.startsWith('/r/') ? 'library' : ''))));
+  $$('.nav a').forEach((l) => l.classList.toggle('active', l.dataset.nav === ({ '/': 'library', '/record': 'record', '/account': 'account', '/plans': 'account', '/translate': 'translate' }[path] || (path.startsWith('/r/') ? 'library' : ''))));
   window.scrollTo(0, 0);
 
   if (path === '/login') return viewLogin(params);
   if (path === '/otp') return viewOtp(params);
   if (path === '/record') return viewRecord();
   if (path === '/account') return viewAccount();
+  if (path === '/plans') return viewPlans();
+  if (path === '/translate') return viewLiveTranslate();
   if (path.startsWith('/r/')) return viewDetail(path.slice(3));
   return viewLibrary();
 }
@@ -297,6 +315,7 @@ async function saveRecording(r) {
   form.append('segments', JSON.stringify(r.segments || []));
   form.append('bookmarks', JSON.stringify(r.bookmarks || []));
   if (r.pitch) form.append('pitch', JSON.stringify(r.pitch));
+  if (r.liveTranslation) form.append('liveTranslation', JSON.stringify(r.liveTranslation));
   form.append('audio', r.blob, r.blob.name || `recording.${ext}`);
   main.innerHTML = `<div class="container"><div class="card stack center"><h2>Saving your recording…</h2>
     <p class="muted">Please keep this page open.</p><div class="meter"><i id="up-bar"></i></div></div></div>`;
@@ -328,6 +347,10 @@ function viewRecord() {
         <label class="field grow"><span>Type</span><select class="input" id="r-kind">${Object.entries(KINDS).map(([k, v]) => `<option value="${k}" ${prefs.kind === k ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
         <label class="field grow"><span>Language</span><select class="input" id="r-lang">${LANGS.map(([c, n]) => `<option value="${c}" ${c === defLang ? 'selected' : ''}>${n}</option>`).join('')}</select></label>
       </div>
+      <div id="tr-box">${hasTranslation()
+        ? `<div class="tr-box"><label class="row small"><input type="checkbox" id="tr-on" ${prefs.translate !== false ? 'checked' : ''}> <b>🌐 Translate live to</b></label>
+            <select class="input" id="tr-target" aria-label="Translate to">${langOptions(prefs.target || me().preferredLang || 'en')}</select></div>`
+        : `<div class="banner small row spread"><span>🌐 <b>Live Translation</b>: see captions translated into your language as people speak.</span><a class="btn sm" href="#/plans">Unlock</a></div>`}</div>
       <div class="timer" id="timer" aria-live="off">0:00</div>
       <div class="meter" aria-hidden="true"><i id="meter"></i></div>
       <div class="voice-now small muted" id="voice-now">${liveCaptionsSupported ? 'Live captions will appear as you speak.' : 'Live captions are not available in this browser; the transcript will be made after you stop' + (state.config.serverTranscription ? '.' : ' (requires a transcription service on the server).')}</div>
@@ -349,12 +372,19 @@ function viewRecord() {
   const rec = new Recorder({ language: $('#r-lang').value });
   state.recorder = rec;
   const live = $('#live');
+  let translator = null;
+  const trLine = (i) => {
+    if (!translator) return '';
+    const l = translator.lines[i];
+    if (!l) return '';
+    return `<span class="tr-line${l.state === 'failed' ? ' muted' : ''}">${l.translation ? esc(l.translation) : l.state === 'failed' ? '(translation unavailable)' : '…'}</span>`;
+  };
   const renderLive = (interim = '') => {
-    live.innerHTML = rec.segments.map((s) => `<p><span class="muted small">${fmtTime(s.start)}</span> ${esc(s.text)}</p>`).join('') +
+    live.innerHTML = rec.segments.map((s, i) => `<p><span class="muted small">${fmtTime(s.start)}</span> ${esc(s.text)}${trLine(i)}</p>`).join('') +
       (interim ? `<p class="interim">${esc(interim)}</p>` : '') || '<p class="muted">Listening…</p>';
     live.scrollTop = live.scrollHeight;
   };
-  rec.addEventListener('segment', () => renderLive());
+  rec.addEventListener('segment', () => { translator?.push(rec.segments[rec.segments.length - 1].text); renderLive(); });
   rec.addEventListener('interim', (e) => renderLive(e.detail.text));
   rec.addEventListener('captions-off', () => { $('#voice-now').textContent = 'Live captions were blocked by the browser. Audio is still being recorded.'; });
   let voiceHist = [];
@@ -377,7 +407,15 @@ function viewRecord() {
     if (rec.state === 'idle') {
       try {
         rec.language = $('#r-lang').value;
-        localStorage.setItem('rec-prefs', JSON.stringify({ kind: $('#r-kind').value, language: rec.language }));
+        const trOn = $('#tr-on')?.checked, trTarget = $('#tr-target')?.value;
+        localStorage.setItem('rec-prefs', JSON.stringify({ kind: $('#r-kind').value, language: rec.language, translate: trOn ?? prefs.translate, target: trTarget || prefs.target }));
+        if (trOn && trTarget) {
+          translator = new LiveTranslator({ target: trTarget, source: baseLang(rec.language) });
+          translator.addEventListener('translated', (e) => { renderLive(rec.interim); if (e.detail.demo && !translator.demoShown) { translator.demoShown = true; toast('Demo translation: no AI key on the server yet.'); } });
+          translator.addEventListener('failed', () => renderLive(rec.interim));
+          translator.addEventListener('locked', (e) => { toast(e.detail.message, true); translator = null; });
+          $('#tr-on').disabled = $('#tr-target').disabled = true;
+        }
         await rec.start({ title: $('#r-title').value, kind: $('#r-kind').value });
         btn.classList.add('recording'); btn.textContent = '●'; btn.setAttribute('aria-label', 'Recording');
         $('#pause-btn').disabled = $('#mark-btn').disabled = $('#stop-btn').disabled = false;
@@ -397,7 +435,9 @@ function viewRecord() {
     $('#stop-btn').disabled = true;
     const out = await rec.stop();
     state.recorder = null;
-    await saveRecording({ ...out, title: $('#r-title').value.trim(), kind: $('#r-kind').value, language: rec.language, notes: $('#r-notes').value });
+    if (translator) { $('#stop-btn').textContent = 'Finishing translation…'; await translator.flush(); }
+    const liveTranslation = translator ? { lang: translator.target, texts: translator.translations } : null;
+    await saveRecording({ ...out, liveTranslation, title: $('#r-title').value.trim(), kind: $('#r-kind').value, language: rec.language, notes: $('#r-notes').value });
   };
 }
 
@@ -441,6 +481,7 @@ async function viewDetail(id) {
       <button role="tab" data-tab="transcript" aria-selected="true">Transcript</button>
       <button role="tab" data-tab="ai" aria-selected="false">✨ AI notes</button>
       <button role="tab" data-tab="notes" aria-selected="false">My notes</button>
+      <button role="tab" data-tab="translate" aria-selected="false">🌐 Translate${hasTranslation() ? '' : ' <span class="badge-pro">PRO</span>'}</button>
     </div>
     <div class="detail-layout">
       <div>
@@ -459,6 +500,7 @@ async function viewDetail(id) {
           <textarea class="input" id="my-notes" style="min-height:320px" placeholder="Your own notes. Markdown supported (# heading, - bullet, **bold**).">${esc(rec.notes)}</textarea>
           <p class="small muted" id="notes-status">Saved automatically.</p>
         </section>
+        <section role="tabpanel" data-panel="translate" hidden id="tr-panel"></section>
       </div>
       <aside class="detail-side stack">
         <div class="card"><h2>Speakers</h2><div id="speakers"></div>
@@ -623,7 +665,55 @@ async function viewDetail(id) {
     try { rec = (await api(`/api/recordings/${rec.id}/transcribe`, { method: 'POST', body: {} })).recording; renderAll(); poll(); } catch (e) { toast(e.message, true); }
   };
 
-  const renderAll = () => { renderStatus(); renderSpeakers(); renderSegments(); renderBookmarks(); renderAi(); };
+  // ---- translation tab (Live Translation add-on) ----
+  let translations = [], trLang = me().preferredLang || 'en';
+  const loadTranslations = async () => {
+    try { translations = (await api(`/api/recordings/${rec.id}/translations`)).translations; } catch { translations = []; }
+    if (translations.length && !translations.some((t) => t.lang === trLang)) trLang = translations[0].lang;
+  };
+  const renderTranslate = () => {
+    const panel = $('#tr-panel');
+    if (!hasTranslation()) { panel.innerHTML = upsellHtml(); return; }
+    const t = translations.find((x) => x.lang === trLang);
+    const kindNotes = rec.kind === 'meeting' ? 'Minutes' : rec.kind === 'sermon' ? 'Sermon notes' : rec.kind === 'lecture' ? 'Study notes' : 'Notes';
+    panel.innerHTML = `<div class="card stack">
+      ${cfg.translationDemo ? '<div class="banner warn small">Demo mode: no AI key is configured on the server, so translations are placeholders that show the flow.</div>' : ''}
+      <div class="row">
+        <label class="field grow"><span>Translate into</span><select class="input" id="tr-lang">${langOptions(trLang)}</select></label>
+      </div>
+      ${translations.length ? `<div class="row small"><span class="muted">Available:</span>${translations.map((x) => `<button class="chip ${x.lang === trLang ? 'on' : ''}" data-trlang="${esc(x.lang)}">${esc(langLabel(x.lang))}${x.origin === 'live' ? ' · live' : ''}</button>`).join('')}</div>` : ''}
+      <div class="row">
+        <button class="btn primary sm" data-trdo="transcript">${t?.segments ? '↻ Re-translate transcript' : 'Translate transcript'}</button>
+        <button class="btn sm" data-trdo="notes">✨ ${kindNotes} in ${esc(langName(trLang))}</button>
+        <button class="btn sm" data-trdo="mynotes" ${rec.notes ? '' : 'disabled title="Write some notes first"'}>Translate my notes</button>
+      </div>
+      ${t ? `<div class="row small"><span class="muted">Export:</span>${['md', 'txt', 'srt'].map((f) => `<a class="chip" href="/api/recordings/${rec.id}/export?format=${f}&lang=${encodeURIComponent(t.lang)}">.${f}</a>`).join('')}</div>` : ''}
+    </div>
+    ${t?.stale ? '<div class="banner warn" style="margin-top:12px">The transcript changed after this translation was made. Press “Re-translate transcript” to update it.</div>' : ''}
+    ${t?.aiNotes ? `<div class="card" style="margin-top:12px"><h2>${kindNotes} (${esc(langLabel(t.lang))})</h2><div class="md">${renderMarkdown(t.aiNotes)}</div></div>` : ''}
+    ${t?.myNotes ? `<div class="card" style="margin-top:12px"><h2>My notes (${esc(langLabel(t.lang))})</h2><div class="md">${renderMarkdown(t.myNotes)}</div></div>` : ''}
+    <div class="card" style="margin-top:12px"><h2>Transcript</h2>${t?.segments && !t.stale ? rec.segments.map((s, i) => {
+      const sp = rec.speakers[s.speaker] || { name: 'Speaker', voice: 'unknown' };
+      return `<div class="seg v-${sp.voice}"><button class="ts" data-seek="${s.start}">${fmtTime(s.start)}</button><span class="who ${sp.voice}">${esc(sp.name)}</span>
+        <div class="text"><div lang="${esc(t.lang)}">${esc(t.segments[i] || '')}</div><div class="orig small muted">${esc(s.text)}</div></div></div>`;
+    }).join('') : `<p class="muted">${rec.segments.length ? 'Not translated into this language yet.' : 'There is no transcript yet.'}</p>`}</div>`;
+  };
+  $('#tr-panel').addEventListener('change', (e) => { if (e.target.id === 'tr-lang') { trLang = e.target.value; renderTranslate(); } });
+  $('#tr-panel').addEventListener('click', async (e) => {
+    const seekBtn = e.target.closest('[data-seek]'); if (seekBtn) return seek(Number(seekBtn.dataset.seek));
+    const chip = e.target.closest('[data-trlang]'); if (chip) { trLang = chip.dataset.trlang; return renderTranslate(); }
+    const b = e.target.closest('[data-trdo]'); if (!b) return;
+    const label = b.textContent; b.disabled = true; b.textContent = 'Translating…';
+    try {
+      const { translation } = await api(`/api/recordings/${rec.id}/translations`, { method: 'POST', body: { lang: trLang, what: b.dataset.trdo } });
+      translations = [translation, ...translations.filter((x) => x.lang !== translation.lang)];
+      toast('Translation ready.');
+    } catch (err) { toast(err.message, true); b.textContent = label; b.disabled = false; return; }
+    renderTranslate();
+  });
+
+  const renderAll = () => { renderStatus(); renderSpeakers(); renderSegments(); renderBookmarks(); renderAi(); renderTranslate(); };
+  if (hasTranslation()) loadTranslations().then(renderTranslate);
   renderAll();
   const poll = () => {
     if (rec.status !== 'transcribing') return;
@@ -654,11 +744,13 @@ async function viewAccount() {
       <div class="row">${user.avatarUrl ? `<img src="${esc(user.avatarUrl)}" alt="" width="56" height="56" style="border-radius:50%">` : ''}
         <div class="grow"><b>${esc(user.name || 'No name')}</b><div class="small muted">${esc(user.email || '')}${user.phone ? ` · ${esc(user.phone)}` : ''}</div></div></div>
       <form id="name-form" class="row"><input class="input grow" name="name" value="${esc(user.name || '')}" placeholder="Your name" aria-label="Your name"><button class="btn">Save</button></form>
+      <label class="field"><span>Preferred language for translations</span>
+        <select class="input" id="pref-lang">${langOptions(user.preferredLang)}</select></label>
       <div class="small">Signed in with: ${user.providers.map((p) => `<span class="chip">${names[p] || p}</span>`).join(' ')}</div>
     </div>
     <div class="card stack" style="margin-top:16px">
       <h2>Plan</h2>
-      <div class="row spread"><span><span class="chip on">Free beta</span> All features are free while we test.</span></div>
+      <div class="row spread"><span><span class="chip on">Free beta</span>${user.addons.includes('translation') ? ' <span class="chip on">🌐 Live Translation</span>' : ''}</span><a class="btn sm" href="#/plans">Plans &amp; add-ons</a></div>
       <div class="small muted">${usage.recordings} recordings · ${usage.minutes} minutes · ${(usage.bytes / 1048576).toFixed(1)} MB stored</div>
     </div>
     <div class="card stack" style="margin-top:16px">
@@ -673,12 +765,151 @@ async function viewAccount() {
     </div>
   </div>`;
   $('#name-form').onsubmit = async (e) => { e.preventDefault(); await api('/api/me', { method: 'PATCH', body: { name: e.target.name.value } }); toast('Saved.'); viewAccount(); };
+  $('#pref-lang').onchange = async (e) => { await api('/api/me', { method: 'PATCH', body: { preferredLang: e.target.value } }); await refreshMe(); toast('Preferred language saved.'); };
   $('#logout').onclick = async () => { await api('/api/auth/logout', { method: 'POST' }); state.auth = null; go('#/login'); };
   $('#delete-acct').onclick = async () => {
     const c = prompt('This cannot be undone. Type DELETE to confirm.');
     if (c !== 'DELETE') return;
     await api('/api/me', { method: 'DELETE', body: { confirm: 'DELETE' } }); state.auth = null; go('#/login');
   };
+}
+
+// ---------------- plans ----------------
+async function viewPlans() {
+  const { addons, testMode } = await api('/api/billing/plans');
+  main.innerHTML = `<div class="container" style="max-width:860px">
+    <h1>Plans &amp; add-ons</h1>
+    ${testMode ? '<div class="banner warn">Test mode: no payment is taken. Use the buttons below to switch add-ons on and off while testing.</div>' : ''}
+    <div class="plans">
+      <div class="card stack"><h2>Free beta</h2><div class="price">Free</div>
+        <ul class="ticks"><li>Unlimited recordings during beta</li><li>Transcripts with speakers and voice detection</li><li>AI sermon notes and meeting minutes</li><li>Export and share</li></ul>
+        <span class="chip on">Current plan</span></div>
+      ${addons.map((a) => `<div class="card stack plan-pro">
+        <div class="row"><span class="badge-pro">ADD-ON</span><h2 style="margin:0">🌐 ${esc(a.name)}</h2></div>
+        <div class="price">${esc(a.price)}</div>
+        <ul class="ticks">${a.features.map((f) => `<li>${esc(f)}</li>`).join('')}</ul>
+        ${a.active
+          ? `<span class="chip on">✓ Active</span>${testMode ? `<button class="btn sm" data-addon="${a.id}" data-act="cancel">Cancel (test)</button>` : ''}`
+          : testMode ? `<button class="btn primary" data-addon="${a.id}" data-act="activate">Activate (test mode – free)</button>` : '<button class="btn primary" disabled>Online payment coming soon</button>'}
+      </div>`).join('')}
+    </div></div>`;
+  main.addEventListener('click', async (e) => {
+    const b = e.target.closest('[data-addon]'); if (!b) return;
+    b.disabled = true;
+    try {
+      const { user } = await api(`/api/billing/test/${b.dataset.act}`, { method: 'POST', body: { addon: b.dataset.addon } });
+      state.auth = { ...state.auth, user };
+      toast(b.dataset.act === 'activate' ? 'Live Translation activated.' : 'Add-on cancelled.');
+      viewPlans();
+    } catch (err) { toast(err.message, true); b.disabled = false; }
+  }, { signal: viewAbort.current });
+}
+
+// ---------------- live translate (interpreter) ----------------
+function viewLiveTranslate() {
+  if (!hasTranslation()) { main.innerHTML = `<div class="container" style="max-width:720px"><h1>Live translate</h1>${upsellHtml()}</div>`; return; }
+  const prefs = JSON.parse(localStorage.getItem('lt-prefs') || '{}');
+  const mine = prefs.mine || me().preferredLang || 'en';
+  main.innerHTML = `<div class="container" style="max-width:900px">
+    <div class="row spread"><h1>Live translate</h1>
+      <div class="row" role="radiogroup" aria-label="Mode"><button class="chip on" data-mode="listen">🎧 Listen</button><button class="chip" data-mode="talk">💬 Conversation</button></div></div>
+    ${speechSupported ? '' : '<div class="banner err">Live listening needs Chrome, Edge or Safari. This browser does not support speech recognition.</div>'}
+    ${state.config.translationDemo ? '<div class="banner warn small" style="margin-bottom:12px">Demo mode: no AI key on the server, translations are placeholders.</div>' : ''}
+    <div class="card stack">
+      <div class="lt-langs">
+        <label class="field"><span id="lbl-src">Language being spoken</span><select class="input" id="lt-src">${SPOKEN_LANGS.map(([c, n]) => `<option value="${c}" ${c === (prefs.src || 'ja-JP') ? 'selected' : ''}>${esc(n)}</option>`).join('')}</select></label>
+        <button class="btn" id="lt-swap" title="Swap languages" aria-label="Swap languages">⇄</button>
+        <label class="field"><span id="lbl-dst">Translate into</span><select class="input" id="lt-dst">${langOptions(mine)}</select></label>
+      </div>
+      <div class="row" id="listen-ctrls"><button class="btn primary" id="lt-start" ${speechSupported ? '' : 'disabled'}>🎤 Start listening</button>
+        <label class="row small"><input type="checkbox" id="lt-speak" ${prefs.speak ? 'checked' : ''}> Read translations aloud</label></div>
+      <div class="talk-ctrls" id="talk-ctrls" hidden>
+        <button class="btn talk-btn" data-who="them" ${speechSupported ? '' : 'disabled'}>🎤 They speak<br><small id="lbl-them"></small></button>
+        <button class="btn talk-btn" data-who="me" ${speechSupported ? '' : 'disabled'}>🎤 I speak<br><small id="lbl-me"></small></button>
+      </div>
+      <p class="small muted lt-hint">Works best with clear speech near the microphone. For music, sung lyrics are only partly recognised. Nothing is saved; use <a href="#/record">Record</a> to keep a transcript.</p>
+    </div>
+    <div class="card lt-captions" id="lt-out" aria-live="polite"><p class="muted">Translations will appear here.</p></div>
+    <div class="row" style="margin-top:10px"><button class="btn sm" id="lt-copy">Copy all</button><button class="btn sm" id="lt-clear">Clear</button></div>
+  </div>`;
+
+  let mode = 'listen', who = null, listener = null;
+  const items = []; // { who, text, translation, target }
+  const translators = {};
+  const out = $('#lt-out');
+  const savePrefs = () => localStorage.setItem('lt-prefs', JSON.stringify({ src: $('#lt-src').value, mine: $('#lt-dst').value, speak: $('#lt-speak').checked }));
+  const render = (interim = '') => {
+    out.innerHTML = items.length || interim ? items.slice(-60).map((it) => `<div class="lt-item ${it.who === 'me' ? 'me' : ''}">
+        <div class="lt-tr" lang="${esc(it.target)}">${it.translation ? esc(it.translation) : '<span class="muted">…</span>'}</div>
+        <div class="small muted">${it.who === 'me' ? 'You: ' : ''}${esc(it.text)}</div></div>`).join('') + (interim ? `<div class="lt-item"><div class="small muted interim">${esc(interim)}</div></div>` : '')
+      : '<p class="muted">Translations will appear here.</p>';
+    out.scrollTop = out.scrollHeight;
+  };
+  const translatorFor = (target, source) => {
+    const key = `${source}>${target}`;
+    if (!translators[key]) {
+      const t = new LiveTranslator({ target, source });
+      t.addEventListener('translated', (e) => {
+        const it = items.find((x) => x.tr === t && x.idx === e.detail.index);
+        if (it) { it.translation = e.detail.text; render(listener?.interim); if ($('#lt-speak').checked || (mode === 'talk' && it.who === 'me')) speak(it.translation, it.target); }
+      });
+      t.addEventListener('locked', (e) => { toast(e.detail.message, true); stop(); });
+      t.addEventListener('error', (e) => toast(e.detail.message, true));
+      translators[key] = t;
+    }
+    return translators[key];
+  };
+  // direction: who='them' -> spoken src, translate into mine; who='me' -> speak mine, translate into theirs
+  const direction = () => {
+    const src = $('#lt-src').value, mineLang = $('#lt-dst').value;
+    return who === 'me' ? { spoken: spokenFor(mineLang), source: mineLang, target: baseLang(src) } : { spoken: src, source: baseLang(src), target: mineLang };
+  };
+  const start = () => {
+    const d = direction();
+    if (listener) listener.setLang(d.spoken);
+    else {
+      listener = state.listener = new Listener(d.spoken);
+      listener.addEventListener('final', (e) => {
+        const dd = direction();
+        const tr = translatorFor(dd.target, dd.source);
+        items.push({ who: who || 'them', text: e.detail.text, translation: null, target: dd.target, tr, idx: tr.push(e.detail.text) });
+        render();
+      });
+      listener.addEventListener('interim', (e) => { listener.interim = e.detail.text; render(e.detail.text); });
+      listener.addEventListener('blocked', () => { toast('Microphone or speech recognition was blocked by the browser.', true); stop(); });
+      try { listener.start(); } catch (err) { toast(err.message, true); listener = state.listener = null; return; }
+      if (window.innerWidth < 700) setTimeout(() => out.scrollIntoView({ behavior: 'smooth', block: 'center' }), 100);
+    }
+    updateButtons();
+  };
+  const stop = () => { listener?.stop(); listener = state.listener = null; who = null; updateButtons(); };
+  const updateButtons = () => {
+    $('#lt-start').textContent = listener ? '■ Stop' : '🎤 Start listening';
+    $('#lt-start').classList.toggle('danger', !!listener);
+    $$('.talk-btn').forEach((b) => b.classList.toggle('active', !!listener && b.dataset.who === who));
+    $('#lbl-them').textContent = `${$('#lt-src').selectedOptions[0].text} → ${langLabel($('#lt-dst').value).split(' ')[0]}`;
+    $('#lbl-me').textContent = `${langLabel($('#lt-dst').value).split(' ')[0]} → ${$('#lt-src').selectedOptions[0].text}`;
+  };
+  $('#lt-start').onclick = () => { if (listener) stop(); else { who = 'them'; start(); } };
+  $$('.talk-btn').forEach((b) => b.onclick = () => { if (listener && who === b.dataset.who) return stop(); who = b.dataset.who; start(); });
+  $$('[data-mode]').forEach((b) => b.onclick = () => {
+    mode = b.dataset.mode; stop();
+    $$('[data-mode]').forEach((x) => x.classList.toggle('on', x === b));
+    $('#listen-ctrls').hidden = mode !== 'listen'; $('#talk-ctrls').hidden = mode !== 'talk';
+    $('#lbl-src').textContent = mode === 'talk' ? 'Their language' : 'Language being spoken';
+    $('#lbl-dst').textContent = mode === 'talk' ? 'My language' : 'Translate into';
+  });
+  $('#lt-swap').onclick = () => {
+    const src = $('#lt-src').value, dst = $('#lt-dst').value;
+    $('#lt-src').value = spokenFor(dst);
+    $('#lt-dst').value = baseLang(src);
+    savePrefs(); if (listener) start(); else updateButtons();
+  };
+  $('#lt-src').onchange = $('#lt-dst').onchange = () => { savePrefs(); if (listener) start(); else updateButtons(); };
+  $('#lt-speak').onchange = savePrefs;
+  $('#lt-copy').onclick = async () => { try { await navigator.clipboard.writeText(items.map((i) => `${i.text}\n→ ${i.translation || ''}`).join('\n\n')); toast('Copied.'); } catch { toast('Could not copy.', true); } };
+  $('#lt-clear').onclick = () => { items.length = 0; render(); };
+  updateButtons();
 }
 
 route().catch((e) => { main.innerHTML = `<div class="container"><div class="card">Could not load: ${esc(e.message)}</div></div>`; });

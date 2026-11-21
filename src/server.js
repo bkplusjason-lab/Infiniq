@@ -4,6 +4,8 @@ import cookieParser from 'cookie-parser';
 import { config, providers } from './config.js';
 import { authRouter } from './routes/auth.js';
 import { recRouter } from './routes/recordings.js';
+import { translateRouter } from './routes/translate.js';
+import { translationAvailable, isMock as translationIsMock } from './services/translate.js';
 import { listOutbox } from './services/outbox.js';
 import { transcriptionAvailable } from './services/transcribe.js';
 import { notesAvailable } from './services/notes.js';
@@ -42,10 +44,14 @@ export function createApp() {
     devLogin: config.devLogin,
     serverTranscription: transcriptionAvailable(),
     aiNotes: notesAvailable(),
+    translation: translationAvailable(),
+    translationDemo: translationIsMock(),
+    billingTestMode: config.billing.testMode,
   }));
 
   app.use(authRouter);
   app.use(recRouter);
+  app.use(translateRouter);
 
   if (config.devLogin) {
     app.get('/api/dev/outbox', (req, res) => res.json({ messages: listOutbox() }));
