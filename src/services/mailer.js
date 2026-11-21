@@ -69,3 +69,25 @@ export function sendOtpEmail(email, code) {
     <p>It expires in 10 minutes. If you did not try to sign in, you can ignore this email.</p>`);
   return sendMail({ to: email, subject, text, html });
 }
+
+export function sendRetentionWarning(user, items) {
+  const fmt = (t) => new Date(t).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' });
+  const lines = items.map((i) => `- "${i.title}": ${i.what === 'audio' ? 'audio' : 'recording, transcript and notes'} will be deleted on ${fmt(i.at)}`);
+  const subject = `Some of your ${config.appName} recordings will be deleted soon`;
+  const text = `Hi ${user.name || 'there'},
+
+Your plan keeps data for a limited time. The following will be deleted soon:
+
+${lines.join('\n')}
+
+To keep them longer, upgrade your plan: ${config.appUrl}/#/plans
+You can also download them now from each recording's Export menu.
+
+The ${config.appName} team`;
+  const html = layout('Some recordings will be deleted soon', `
+    <p>Your plan keeps data for a limited time. The following will be deleted soon:</p>
+    <ul>${items.map((i) => `<li><b>${esc(i.title)}</b>: ${i.what === 'audio' ? 'audio' : 'recording, transcript and notes'} on ${esc(fmt(i.at))}</li>`).join('')}</ul>
+    <p style="margin:24px 0"><a href="${esc(config.appUrl)}/#/plans" style="background:#3b4cca;color:#fff;text-decoration:none;padding:12px 22px;border-radius:8px;font-weight:600">Upgrade to keep them</a></p>
+    <p>You can also download them now from each recording's Export menu.</p>`);
+  return sendMail({ to: user.email, subject, text, html });
+}

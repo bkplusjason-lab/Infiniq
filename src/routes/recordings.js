@@ -10,6 +10,9 @@ import { transcribeFile, transcriptionAvailable } from '../services/transcribe.j
 import { generateNotes, notesAvailable } from '../services/notes.js';
 import { saveLiveTranslation } from './translate.js';
 import { LANG_RE, sourceHash } from '../services/translate.js';
+import {
+  usageOf, checkRecording, checkAiNotes, checkExport, aiTranscriptionAllowed, recordUsage, sendLimit, expiryOf, planOf, LimitError,
+} from '../services/plans.js';
 
 export const recRouter = Router();
 const KINDS = ['sermon', 'lecture', 'meeting', 'other'];
@@ -56,8 +59,10 @@ function sanitizePitch(p) {
   return { step: Number(p.step), f0: p.f0.slice(0, 200000).map((v) => Math.max(0, Math.min(1000, Math.round(Number(v) || 0)))) };
 }
 
-function view(r, full = false) {
+function view(r, full = false, user = null) {
+  const exp = user ? expiryOf(r, user) : {};
   const base = {
+    audioDeleteAt: exp.audioDeleteAt ?? null, textDeleteAt: exp.textDeleteAt ?? null, audioDeletedAt: r.audio_deleted_at || null,
     id: r.id, title: r.title, kind: r.kind, tags: r.tags ? r.tags.split(',').filter(Boolean) : [],
     language: r.language, durationSec: r.duration_sec, status: r.status, error: r.error,
     hasAudio: !!r.audio_file, transcriptSource: r.transcript_source, createdAt: r.created_at, updatedAt: r.updated_at,
@@ -99,7 +104,7 @@ db.prepare("UPDATE recordings SET status = 'error', error = 'Transcription was i
 // ---------- account ----------
 recRouter.get('/api/me', (req, res) => {
   const u = db.prepare('SELECT COUNT(*) AS n, COALESCE(SUM(duration_sec),0) AS secs, COALESCE(SUM(size_bytes),0) AS bytes FROM recordings WHERE user_id = ?').get(req.user.id);
-  res.json({ user: publicUser(req.user), usage: { recordings: u.n, minutes: Math.round(u.secs / 60), bytes: u.bytes } });
+  res.json({ user: publicUser(req.user), usage: { recordings: u.n, minutes: Math.round(u.secs / 60), bytes: u.bytes }, plan: usageOf(req.user) });
 });
 recRouter.patch('/api/me', (req, res) => {
   const name = clean(req.body?.name, 100).trim();
@@ -133,11 +138,19 @@ recRouter.get('/api/recordings', (req, res) => {
     args.push(like, like, like, like, like);
   }
   sql += ' ORDER BY created_at DESC LIMIT 500';
-  res.json({ recordings: db.prepare(sql).all(...args).map((r) => view(r)) });
+  res.json({ recordings: db.prepare(sql).all(...args).map((r) => view(r, false, req.user)) });
 });
 
 recRouter.post('/api/recordings', upload.single('audio'), async (req, res) => {
   const b = req.body || {};
+  // plan limits (checked on the server; the browser also stops early)
+  let durationSec = Number(b.durationSec) || 0;
+  if (!durationSec && req.file) durationSec = req.file.size / 16000; // unknown length: estimate (~128 kbps)
+  try { checkRecording(req.user, durationSec); } catch (e) {
+    if (req.file) fs.rmSync(req.file.path, { force: true });
+    if (e instanceof LimitError) return sendLimit(res, e);
+    throw e;
+  }
   const id = newId();
   const kind = KINDS.includes(b.kind) ? b.kind : 'other';
   const title = clean(b.title, 200).trim() || `${kind[0].toUpperCase() + kind.slice(1)} – ${new Date().toLocaleString('en-GB')}`;
@@ -147,24 +160,27 @@ recRouter.post('/api/recordings', upload.single('audio'), async (req, res) => {
   const speakers = buildSpeakers(segments, pitch, {});
   const bookmarks = (parse(b.bookmarks, []) || []).slice(0, 500).map((m) => ({ t: Number(m.t) || 0, label: clean(m.label, 200) }));
   const tags = clean(b.tags, 300).split(',').map((t) => t.trim()).filter(Boolean).join(',');
-  const willTranscribe = !!req.file && transcriptionAvailable() && b.transcribe !== 'false';
+  // Free plan: AI speaker detection only for files without a live transcript (imports), within its monthly minutes.
+  const wantsAi = planOf(req.user).id !== 'free' || !segments.length;
+  const willTranscribe = !!req.file && transcriptionAvailable() && b.transcribe !== 'false' && wantsAi && aiTranscriptionAllowed(req.user, durationSec);
   db.prepare(`INSERT INTO recordings (id, user_id, title, kind, tags, language, audio_file, mime, size_bytes, duration_sec, status,
       transcript_source, segments_json, speakers_json, pitch_json, bookmarks_json, notes_md, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
     .run(id, req.user.id, title, kind, tags, clean(b.language, 20) || null,
       req.file ? `${req.user.id}/${req.file.filename}` : null, req.file?.mimetype || null, req.file?.size || 0,
-      Number(b.durationSec) || null, willTranscribe ? 'transcribing' : 'ready', segments.length ? 'browser' : null,
+      durationSec || null, willTranscribe ? 'transcribing' : 'ready', segments.length ? 'browser' : null,
       JSON.stringify(segments), JSON.stringify(speakers), pitch ? JSON.stringify(pitch) : null, JSON.stringify(bookmarks),
       clean(b.notes, 200000), now(), now());
+  recordUsage(req.user.id, 'recording', durationSec);
   saveLiveTranslation(req.user, id, segments, parse(b.liveTranslation, null));
-  if (willTranscribe) runTranscription(id);
-  res.status(201).json({ recording: view(db.prepare('SELECT * FROM recordings WHERE id = ?').get(id), true) });
+  if (willTranscribe) { recordUsage(req.user.id, 'ai_transcription', durationSec); runTranscription(id); }
+  res.status(201).json({ recording: view(db.prepare('SELECT * FROM recordings WHERE id = ?').get(id), true, req.user) });
 });
 
 recRouter.get('/api/recordings/:id', (req, res) => {
   const r = getOwned(req);
   if (!r) return res.status(404).json({ error: 'Not found' });
-  res.json({ recording: view(r, true) });
+  res.json({ recording: view(r, true, req.user) });
 });
 
 recRouter.get('/api/recordings/:id/audio', (req, res) => {
@@ -198,10 +214,10 @@ recRouter.patch('/api/recordings/:id', (req, res) => {
     for (const id of Object.keys(cur)) if (!rebuilt[id] && segments.some((s) => s.speaker === id)) rebuilt[id] = cur[id];
     sets.push('speakers_json = ?'); args.push(JSON.stringify(rebuilt));
   }
-  if (!sets.length) return res.json({ recording: view(r, true) });
+  if (!sets.length) return res.json({ recording: view(r, true, req.user) });
   sets.push('updated_at = ?'); args.push(now());
   db.prepare(`UPDATE recordings SET ${sets.join(', ')} WHERE id = ?`).run(...args, r.id);
-  res.json({ recording: view(getOwned(req), true) });
+  res.json({ recording: view(getOwned(req), true, req.user) });
 });
 
 recRouter.post('/api/recordings/:id/transcribe', (req, res) => {
@@ -210,19 +226,23 @@ recRouter.post('/api/recordings/:id/transcribe', (req, res) => {
   if (!r.audio_file) return res.status(400).json({ error: 'This item has no audio.' });
   if (!transcriptionAvailable()) return res.status(400).json({ error: 'No transcription service is configured on the server.' });
   if (r.status === 'transcribing') return res.status(409).json({ error: 'Already transcribing.' });
+  if (!aiTranscriptionAllowed(req.user, r.duration_sec)) return sendLimit(res, new LimitError("You've used this month's AI transcription minutes. Upgrade to Plus for 30 hours a month."));
+  recordUsage(req.user.id, 'ai_transcription', r.duration_sec || 60);
   db.prepare("UPDATE recordings SET status = 'transcribing' WHERE id = ?").run(r.id);
   runTranscription(r.id);
-  res.json({ recording: view(getOwned(req), true) });
+  res.json({ recording: view(getOwned(req), true, req.user) });
 });
 
 recRouter.post('/api/recordings/:id/notes', async (req, res) => {
   const r = getOwned(req);
   if (!r) return res.status(404).json({ error: 'Not found' });
   if (!notesAvailable()) return res.status(400).json({ error: 'AI notes are not configured on the server (ANTHROPIC_API_KEY).' });
+  try { checkAiNotes(req.user); } catch (e) { return sendLimit(res, e); }
   try {
     const md = await generateNotes(r, parse(r.segments_json, []), parse(r.speakers_json, {}), parse(r.bookmarks_json, []));
     db.prepare('UPDATE recordings SET ai_notes_md = ?, updated_at = ? WHERE id = ?').run(md, now(), r.id);
-    res.json({ recording: view(getOwned(req), true) });
+    recordUsage(req.user.id, 'ai_notes', 1);
+    res.json({ recording: view(getOwned(req), true, req.user) });
   } catch (e) {
     console.error('notes failed', e);
     res.status(e.status || 502).json({ error: e.status ? e.message : 'Could not generate notes right now. Try again later.' });
@@ -253,7 +273,7 @@ recRouter.get('/api/recordings/:id/export', (req, res) => {
   let title = r.title, aiNotes = r.ai_notes_md, myNotes = r.notes_md;
   // ?lang=xx exports the translated version (Live Translation add-on)
   if (req.query.lang && LANG_RE.test(String(req.query.lang))) {
-    if (!(req.user.addons || '').split(',').includes('translation')) return res.status(402).json({ error: 'Translated exports need the Live Translation add-on.', code: 'upgrade_required' });
+    if (!planOf(req.user).features.translation) return res.status(402).json({ error: 'Translated exports are part of the Pro plan.', code: 'upgrade_required' });
     const t = db.prepare('SELECT * FROM translations WHERE recording_id = ? AND lang = ?').get(r.id, req.query.lang);
     if (!t) return res.status(404).json({ error: 'No translation in that language yet.' });
     const tr = parse(t.segments_json, null);
@@ -262,6 +282,7 @@ recRouter.get('/api/recordings/:id/export', (req, res) => {
     title = `${r.title} (${req.query.lang})`; aiNotes = t.ai_notes_md; myNotes = t.my_notes_md;
   }
   const fmt = ['txt', 'md', 'srt', 'vtt'].includes(req.query.format) ? req.query.format : 'txt';
+  try { checkExport(req.user, fmt); } catch (e) { return sendLimit(res, e); }
   const date = new Date(r.created_at).toLocaleString('en-GB');
   let out;
   if (fmt === 'srt') out = segs.map((s, i) => `${i + 1}\n${ts(s.start, ',')} --> ${ts(s.end, ',')}\n${who(s.speaker)}: ${s.text}\n`).join('\n');

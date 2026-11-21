@@ -51,11 +51,11 @@ try {
   await page.waitForSelector('.upsell');
   await page.screenshot({ path: `${shots}/t1-locked-mobile.png` });
 
-  // activate the add-on (test mode)
+  // upgrade to Pro (test mode)
   await page.click('.upsell a[href="#/plans"]');
-  await page.waitForSelector('[data-act=activate]');
-  await page.click('[data-act=activate]');
-  await page.waitForSelector('text=✓ Active');
+  await page.waitForSelector('[data-plan=pro]');
+  await page.click('[data-plan=pro]');
+  await page.waitForSelector('.plan-current >> text=Pro');
   await page.screenshot({ path: `${shots}/t2-plans-mobile.png`, fullPage: true });
 
   // live interpreter: Japanese -> English

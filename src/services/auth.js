@@ -3,6 +3,7 @@ import { db, now, newId } from '../db.js';
 import { config } from '../config.js';
 import { sendOtpEmail, sendWelcomeEmail } from './mailer.js';
 import { sendWhatsAppOtp } from './whatsapp.js';
+import { planOf } from './plans.js';
 
 export const SESSION_COOKIE = 'sid';
 const PENDING_TTL = 15 * 60 * 1000;
@@ -18,8 +19,6 @@ export function cookieOptions(maxAgeMs) {
 }
 
 // ---------- users ----------
-export const addonsOf = (u) => (u?.addons || '').split(',').filter(Boolean);
-export const hasAddon = (u, addon) => addonsOf(u).includes(addon);
 
 export const getUser = (id) => db.prepare('SELECT * FROM users WHERE id = ?').get(id);
 
@@ -28,7 +27,8 @@ export function publicUser(u) {
   const ids = db.prepare('SELECT provider FROM identities WHERE user_id = ?').all(u.id).map((r) => r.provider);
   return {
     id: u.id, name: u.name, email: u.email, phone: u.phone, avatarUrl: u.avatar_url, plan: u.plan, providers: ids,
-    createdAt: u.created_at, preferredLang: u.preferred_lang || 'en', addons: addonsOf(u),
+    createdAt: u.created_at, preferredLang: u.preferred_lang || 'en',
+    planName: planOf(u).name, planInterval: u.plan_interval || null, features: planOf(u).features, retention: planOf(u).retention,
   };
 }
 

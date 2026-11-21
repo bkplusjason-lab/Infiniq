@@ -161,7 +161,10 @@ test('recordings: upload, voice analysis, edit, search, export, delete, isolatio
   assert.equal((await c.get('/api/recordings?q=nomatch')).data.recordings.length, 0);
   assert.equal((await c.get('/api/recordings?kind=meeting')).data.recordings.length, 0);
 
-  // export
+  // export: free plan = text only
+  assert.equal((await c.get(`/api/recordings/${rec.id}/export?format=txt`)).status, 200);
+  assert.equal((await c.get(`/api/recordings/${rec.id}/export?format=md`)).status, 402);
+  await c.post('/api/billing/test/subscribe', { plan: 'plus', interval: 'month' });
   const md = await c.get(`/api/recordings/${rec.id}/export?format=md`);
   assert.match(md.data, /\*\*\[0:00\] Pastor John:\*\* Good morning/);
   const srt = await c.get(`/api/recordings/${rec.id}/export?format=srt`);

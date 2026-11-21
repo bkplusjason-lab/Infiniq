@@ -35,7 +35,8 @@ async function api(path, { method = 'GET', body, form } = {}) {
   });
   const data = await res.json().catch(() => ({}));
   if (res.status === 401 && !path.startsWith('/api/auth')) { state.auth = { state: 'signed_out' }; go('#/login'); }
-  if (!res.ok) throw Object.assign(new Error(data.error || `Request failed (${res.status})`), { status: res.status, data });
+  if (res.status === 402) showUpgrade(data.error || 'This needs a paid plan.');
+  if (!res.ok) throw Object.assign(new Error(data.error || `Request failed (${res.status})`), { status: res.status, data, shown: res.status === 402 });
   return data;
 }
 
@@ -45,7 +46,11 @@ function uploadWithProgress(form, onProgress) {
     x.open('POST', '/api/recordings');
     x.setRequestHeader('X-Requested-With', 'infiniq');
     x.upload.onprogress = (e) => e.lengthComputable && onProgress(e.loaded / e.total);
-    x.onload = () => { const d = JSON.parse(x.responseText || '{}'); x.status < 300 ? resolve(d) : reject(new Error(d.error || 'Upload failed')); };
+    x.onload = () => {
+      let d = {}; try { d = JSON.parse(x.responseText || '{}'); } catch {}
+      if (x.status < 300) return resolve(d);
+      reject(Object.assign(new Error(d.error || 'Upload failed'), { status: x.status, data: d }));
+    };
     x.onerror = () => reject(new Error('Network error while uploading. Your recording is kept on this device; try again.'));
     x.send(form);
   });
@@ -54,7 +59,32 @@ function uploadWithProgress(form, onProgress) {
 const state = { config: null, auth: null, recorder: null };
 const me = () => state.auth?.user || {};
 const langName = (code) => { try { return new Intl.DisplayNames([navigator.language || 'en'], { type: 'language' }).of(code); } catch { return code; } };
-const hasTranslation = () => (me().addons || []).includes('translation');
+const hasTranslation = () => !!me().features?.translation;
+const fmtDay = (ms) => new Date(ms).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' });
+const fmtDur = (sec) => { const m = Math.round((sec || 0) / 60); return m > 60 ? `${Math.round(m / 6) / 10} h` : `${m} min`; };
+const ceilMin = (sec) => Math.ceil((sec || 0) / 60);
+function meter(used, limit, label) {
+  if (limit == null) return `<div class="usage"><div class="row spread small"><span>${label}</span><span class="muted">Unlimited</span></div></div>`;
+  const pct = limit ? Math.min(100, Math.round((used / limit) * 100)) : 100;
+  return `<div class="usage"><div class="row spread small"><span>${label}</span><span class="muted">${esc(String(used))} / ${esc(String(limit))}</span></div>
+    <div class="meter${pct >= 90 ? ' full' : ''}"><i style="width:${pct}%"></i></div></div>`;
+}
+
+/** Pop-up shown whenever a plan limit is reached. */
+function showUpgrade(message, title = 'Upgrade your plan') {
+  document.querySelector('dialog.upgrade')?.remove();
+  const d = document.createElement('dialog');
+  d.className = 'upgrade card';
+  d.innerHTML = `<h2>${esc(title)}</h2><p>${esc(message)}</p>
+    <div class="plan-mini"><div><b>Plus</b> ${esc(state.config.currency || 'US$')}4/mo<br><span class="small muted">Unlimited recording, AI speakers, keep notes forever</span></div>
+    <div><b>Pro</b> ${esc(state.config.currency || 'US$')}8/mo<br><span class="small muted">Everything + live translation</span></div></div>
+    <div class="row" style="justify-content:flex-end;margin-top:14px"><button class="btn" value="close">Not now</button><a class="btn primary" href="#/plans">See plans</a></div>`;
+  document.body.append(d);
+  d.querySelector('[value=close]').onclick = () => d.close();
+  d.querySelector('a').onclick = () => d.close();
+  d.addEventListener('close', () => d.remove());
+  d.showModal();
+}
 const langOptions = (sel) => TARGET_LANGS.map(([c, n]) => `<option value="${c}" ${c === sel ? 'selected' : ''}>${esc(n)}</option>`).join('');
 async function refreshMe() { const { user } = await api('/api/me'); state.auth = { ...state.auth, user }; return user; }
 
@@ -62,10 +92,10 @@ async function refreshMe() { const { user } = await api('/api/me'); state.auth =
 function upsellHtml(compact = false) {
   return `<div class="card upsell stack">
     <div class="row"><span class="badge-pro">PRO</span><h2 style="margin:0">🌐 Live Translation</h2></div>
-    <p>Understand every sermon, lecture and meeting in your own language, as it happens.</p>
+    <p>Understand every sermon, lecture and meeting in your own language, as it happens. Included in the <b>Pro</b> plan.</p>
     ${compact ? '' : `<ul class="ticks"><li>Real-time translated captions while recording</li><li>Two-way conversation interpreter with read-aloud</li>
       <li>Translate full transcripts into 30+ languages</li><li>Notes and meeting minutes written in your preferred language</li><li>Translated exports and subtitles</li></ul>`}
-    <a class="btn primary" href="#/plans">See plan &amp; unlock</a>
+    <a class="btn primary" href="#/plans">Upgrade to Pro</a>
   </div>`;
 }
 const go = (hash) => { if (location.hash !== hash) location.hash = hash; else route(); };
@@ -250,7 +280,8 @@ async function viewLibrary() {
       <div class="row"><label class="btn" for="import-file">⬆ Import audio</label><input id="import-file" type="file" accept="audio/*,video/*" hidden>
       <a class="btn primary" href="#/record">● New recording</a></div></div>
     <div id="recover"></div>
-    <div class="stats" id="stats"></div>
+    <div id="expiring"></div>
+    <div class="card plan-card" id="stats"></div>
     <div class="toolbar">
       <input class="input" id="q" type="search" placeholder="Search titles, transcripts and notes…" aria-label="Search">
       <div class="row" id="kinds">${['', ...Object.keys(KINDS)].map((k) => `<button class="chip ${k ? '' : 'on'}" data-kind="${k}">${k ? KINDS[k] : 'All'}</button>`).join('')}</div>
@@ -261,15 +292,30 @@ async function viewLibrary() {
   const load = async () => {
     const q = $('#q').value.trim();
     const { recordings } = await api(`/api/recordings?${new URLSearchParams({ q, kind })}`);
+    if (!q && !kind) showExpiring(recordings);
     $('#list').innerHTML = recordings.length ? recordings.map((r) => `
       <a class="card rec-card" href="#/r/${r.id}">
         <div class="row small"><span class="chip kind-${r.kind}">${KINDS[r.kind]}</span>
           ${r.status === 'transcribing' ? '<span class="chip">⏳ Transcribing</span>' : ''}${r.status === 'error' ? '<span class="chip">⚠ Needs attention</span>' : ''}
-          ${r.hasAiNotes ? '<span class="chip">✨ Notes</span>' : ''}</div>
+          ${r.hasAiNotes ? '<span class="chip">✨ Notes</span>' : ''}${expiryChip(r)}</div>
         <h3>${esc(r.title)}</h3>
         <p>${esc(r.preview || 'No transcript yet.')}</p>
         <div class="row small muted" style="margin-top:8px">${fmtDate(r.createdAt)} · ${fmtTime(r.durationSec)}${r.speakerCount ? ` · ${r.speakerCount} speaker${r.speakerCount > 1 ? 's' : ''}` : ''}</div>
       </a>`).join('') : `<div class="empty card" style="grid-column:1/-1">${q || kind ? 'Nothing matches your search.' : 'No recordings yet. Tap <b>New recording</b> to capture your first sermon, lecture or meeting.'}</div>`;
+  };
+  const DAYMS = 86400_000;
+  function expiryChip(r) {
+    const soon = (t) => t && t - Date.now() < 7 * DAYMS;
+    if (soon(r.textDeleteAt)) return `<span class="chip warn">🗑 Deletes ${esc(fmtDay(r.textDeleteAt))}</span>`;
+    if (soon(r.audioDeleteAt)) return `<span class="chip warn">🔈 Audio deletes ${esc(fmtDay(r.audioDeleteAt))}</span>`;
+    if (r.audioDeletedAt) return '<span class="chip">Audio removed</span>';
+    return '';
+  }
+  const showExpiring = (recs) => {
+    const soon = recs.filter((r) => (r.textDeleteAt && r.textDeleteAt - Date.now() < 7 * DAYMS) || (r.audioDeleteAt && r.audioDeleteAt - Date.now() < 7 * DAYMS));
+    $('#expiring').innerHTML = soon.length ? `<div class="banner warn row spread" style="margin-bottom:14px">
+      <span>🗑 ${soon.length} recording${soon.length > 1 ? 's' : ''} will have data deleted within 7 days under your plan. Export them or upgrade to keep them longer.</span>
+      <a class="btn sm primary" href="#/plans">Keep them</a></div>` : '';
   };
   $('#q').addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(load, 250); });
   $('#kinds').addEventListener('click', (e) => {
@@ -278,10 +324,18 @@ async function viewLibrary() {
   });
   $('#import-file').addEventListener('change', (e) => e.target.files[0] && importFile(e.target.files[0]));
   load().catch((e) => toast(e.message, true));
-  api('/api/me').then(({ usage }) => {
-    $('#stats').innerHTML = `<div class="card stat"><b>${usage.recordings}</b><span class="small muted">Recordings</span></div>
-      <div class="card stat"><b>${usage.minutes}</b><span class="small muted">Minutes</span></div>
-      <div class="card stat"><b>${(usage.bytes / 1048576).toFixed(0)} MB</b><span class="small muted">Storage</span></div>`;
+  api('/api/me').then(({ user, usage, plan }) => {
+    state.auth = { ...state.auth, user };
+    const R = plan.recording;
+    $('#stats').innerHTML = `<div class="row spread"><div><span class="chip on">${esc(user.planName)} plan</span>
+        <span class="small muted">${usage.recordings} recording${usage.recordings === 1 ? '' : 's'} · resets ${esc(fmtDay(plan.periodEnd))}</span></div>
+        ${plan.plan === 'pro' ? '' : `<a class="btn sm primary" href="#/plans">${plan.plan === 'free' ? 'Upgrade' : 'Get Pro'}</a>`}</div>
+      <div class="usage-grid">
+        ${meter(ceilMin(R.usedSec), Math.round(R.limitSec / 60), 'Recording minutes this month')}
+        ${R.perDay != null ? meter(R.todayCount, R.perDay, R.canRecord ? 'Recordings in the last 24 h' : `Next recording: ${fmtDate(R.nextRecordingAt)}`) : ''}
+        ${meter(plan.aiNotes.used, plan.aiNotes.limit, 'AI notes & minutes')}
+        ${plan.translation.enabled ? meter(Math.round(plan.translation.usedMin / 6) / 10, plan.translation.limitMin / 60, 'Translation hours') : ''}
+      </div>`;
   }).catch(() => {});
   const saved = await backup.load();
   if (saved && saved.blob.size > 0) {
@@ -325,19 +379,32 @@ async function saveRecording(r) {
     toast('Saved.');
     go(`#/r/${recording.id}`);
   } catch (e) {
-    toast(e.message, true);
-    main.innerHTML = `<div class="container"><div class="card stack center"><h2>Could not save</h2><p>${esc(e.message)}</p>
-      <button class="btn primary" id="retry">Try again</button></div></div>`;
+    const limit = e.status === 402;
+    if (!limit) toast(e.message, true);
+    main.innerHTML = `<div class="container"><div class="card stack center"><h2>${limit ? 'Plan limit reached' : 'Could not save'}</h2><p>${esc(e.message)}</p>
+      ${limit ? '<p class="small muted">Your recording is kept safely on this device. Upgrade, then press “Try again” to save it.</p>' : ''}
+      <div class="row" style="justify-content:center">${limit ? '<a class="btn primary" href="#/plans">See plans</a>' : ''}<button class="btn ${limit ? '' : 'primary'}" id="retry">Try again</button></div></div></div>`;
     $('#retry').onclick = () => saveRecording(r);
   }
 }
 
 // ---------------- record ----------------
-function viewRecord() {
+async function viewRecord() {
   if (!recordingSupported) {
     main.innerHTML = `<div class="container"><div class="card"><h1>Recording not supported</h1><p>This browser can't record audio. Please use a recent version of Chrome, Edge, Safari or Firefox. You can still <a href="#/">import an audio file</a>.</p></div></div>`;
     return;
   }
+  const { plan: usage } = await api('/api/me');
+  const R = usage.recording;
+  if (!R.canRecord) {
+    main.innerHTML = `<div class="container" style="max-width:640px"><div class="card stack center">
+      <h1>⏳ Recording limit reached</h1><p>${esc(R.blockedReason)}</p>
+      ${R.nextRecordingAt ? `<p class="muted">You can record again on <b>${esc(fmtDate(R.nextRecordingAt))}</b>.</p>` : ''}
+      <p>Upgrade to <b>Plus</b> (${esc(state.config.currency)}4/month) for unlimited daily recordings.</p>
+      <div class="row" style="justify-content:center"><a class="btn primary" href="#/plans">See plans</a><a class="btn" href="#/">Back to library</a></div></div></div>`;
+    return;
+  }
+  const allowedSec = R.allowedSec;
   const prefs = JSON.parse(localStorage.getItem('rec-prefs') || '{}');
   const defLang = prefs.language || (LANGS.find(([c]) => c === navigator.language)?.[0]) || 'en-US';
   main.innerHTML = `<div class="container"><div class="rec-layout">
@@ -350,7 +417,7 @@ function viewRecord() {
       <div id="tr-box">${hasTranslation()
         ? `<div class="tr-box"><label class="row small"><input type="checkbox" id="tr-on" ${prefs.translate !== false ? 'checked' : ''}> <b>🌐 Translate live to</b></label>
             <select class="input" id="tr-target" aria-label="Translate to">${langOptions(prefs.target || me().preferredLang || 'en')}</select></div>`
-        : `<div class="banner small row spread"><span>🌐 <b>Live Translation</b>: see captions translated into your language as people speak.</span><a class="btn sm" href="#/plans">Unlock</a></div>`}</div>
+        : `<div class="banner small row spread"><span>🌐 <b>Live Translation</b> (Pro): see captions translated into your language as people speak.</span><a class="btn sm" href="#/plans">Upgrade</a></div>`}</div>
       <div class="timer" id="timer" aria-live="off">0:00</div>
       <div class="meter" aria-hidden="true"><i id="meter"></i></div>
       <div class="voice-now small muted" id="voice-now">${liveCaptionsSupported ? 'Live captions will appear as you speak.' : 'Live captions are not available in this browser; the transcript will be made after you stop' + (state.config.serverTranscription ? '.' : ' (requires a transcription service on the server).')}</div>
@@ -360,6 +427,9 @@ function viewRecord() {
         <button class="btn" id="mark-btn" disabled>🔖 Bookmark</button>
         <button class="btn primary" id="stop-btn" disabled>■ Stop &amp; save</button>
       </div>
+      <p class="small center limit-note">${usage.plan === 'free'
+        ? `Free plan: up to ${fmtDur(R.maxRecordingSec)} per recording · ${R.leftToday} recording left today · ${fmtDur(R.leftSec)} left this month. <a href="#/plans">Upgrade</a>`
+        : `${esc(me().planName || '')} plan: up to ${fmtDur(allowedSec)} for this recording.`}</p>
       <p class="small muted center">Tip: place your device close to the speaker. Keep this tab open; the screen will stay awake.</p>
     </div>
     <div class="stack">
@@ -388,9 +458,13 @@ function viewRecord() {
   rec.addEventListener('interim', (e) => renderLive(e.detail.text));
   rec.addEventListener('captions-off', () => { $('#voice-now').textContent = 'Live captions were blocked by the browser. Audio is still being recorded.'; });
   let voiceHist = [];
+  let limitWarned = false;
   rec.addEventListener('level', (e) => {
     $('#meter').style.width = `${Math.round(e.detail.level * 100)}%`;
     $('#timer').textContent = fmtTime(rec.elapsed);
+    // plan limit: warn 2 minutes before, then stop and save automatically
+    if (!limitWarned && rec.elapsed >= allowedSec - 120) { limitWarned = true; toast(`Your plan allows ${fmtDur(allowedSec)} for this recording. It will stop and save in 2 minutes.`); }
+    if (rec.elapsed >= allowedSec && rec.state === 'recording' && !$('#stop-btn').disabled) { toast('Plan limit reached: saving your recording.'); $('#stop-btn').click(); }
     if (e.detail.f0) voiceHist.push(e.detail.f0);
     if (voiceHist.length > 25) voiceHist = voiceHist.slice(-25);
     if (voiceHist.length >= 10) {
@@ -442,6 +516,17 @@ function viewRecord() {
 }
 
 // ---------------- detail ----------------
+function retentionNote(rec) {
+  const parts = [];
+  if (rec.audioDeletedAt) parts.push(`The audio was cleared on ${fmtDay(rec.audioDeletedAt)} after your plan's storage period; the transcript and notes are kept.`);
+  else if (rec.audioDeleteAt) parts.push(`Audio kept until <b>${esc(fmtDay(rec.audioDeleteAt))}</b>.`);
+  if (rec.textDeleteAt) parts.push(`Transcript and notes kept until <b>${esc(fmtDay(rec.textDeleteAt))}</b>.`);
+  if (!parts.length) return '';
+  const soon = [rec.audioDeleteAt, rec.textDeleteAt].some((t) => t && t - Date.now() < 7 * 86400_000);
+  return `<div class="banner small ${soon ? 'warn' : ''} row spread" style="margin:10px 0"><span>${parts.join(' ')}</span>
+    ${me().plan === 'pro' ? '' : '<a class="btn sm" href="#/plans">Keep longer</a>'}</div>`;
+}
+
 async function viewDetail(id) {
   main.innerHTML = '<div class="loading">Loading…</div>';
   let rec;
@@ -462,10 +547,10 @@ async function viewDetail(id) {
       <div class="row">
         <div class="menu"><button class="btn" id="export-btn" aria-haspopup="true">⬇ Export</button>
           <div class="menu-list" id="export-menu" hidden>
-            <a href="/api/recordings/${rec.id}/export?format=md">Markdown (.md)</a>
-            <a href="/api/recordings/${rec.id}/export?format=txt">Plain text (.txt)</a>
-            <a href="/api/recordings/${rec.id}/export?format=srt">Subtitles (.srt)</a>
-            <a href="/api/recordings/${rec.id}/export?format=vtt">Subtitles (.vtt)</a>
+            ${[['md', 'Markdown (.md)'], ['txt', 'Plain text (.txt)'], ['srt', 'Subtitles (.srt)'], ['vtt', 'Subtitles (.vtt)']].map(([f, label]) =>
+              (me().features?.exports || ['txt']).includes(f)
+                ? `<a href="/api/recordings/${rec.id}/export?format=${f}">${label}</a>`
+                : `<button type="button" data-locked-export="${f}">${label} <span class="badge-pro">PLUS</span></button>`).join('')}
             ${rec.hasAudio ? `<a href="/api/recordings/${rec.id}/audio" download>Audio file</a>` : ''}
             <button type="button" id="print-btn">Print / Save as PDF</button>
             <button type="button" id="share-btn">Share…</button>
@@ -474,6 +559,7 @@ async function viewDetail(id) {
       </div>
     </div>
     <div id="status-banner"></div>
+    ${retentionNote(rec)}
     ${rec.hasAudio ? `<div class="card player"><audio id="audio" controls preload="metadata" src="/api/recordings/${rec.id}/audio"></audio>
       <div class="row small" style="margin-top:6px"><span class="muted">Speed</span>${[0.75, 1, 1.25, 1.5, 2].map((s) => `<button class="chip ${s === 1 ? 'on' : ''}" data-rate="${s}">${s}×</button>`).join('')}
       <button class="chip" data-skip="-10">⟲ 10s</button><button class="chip" data-skip="10">10s ⟳</button></div></div>` : ''}
@@ -493,6 +579,7 @@ async function viewDetail(id) {
         <section role="tabpanel" data-panel="ai" class="card" hidden>
           <div class="row spread"><h2 style="margin:0">AI notes</h2>
             <div class="row"><button class="btn sm" id="ai-edit" hidden>Edit</button><button class="btn sm primary" id="ai-gen">✨ Generate</button></div></div>
+          <p class="small muted" id="ai-left"></p>
           <div id="ai-body" class="md" style="margin-top:12px"></div>
         </section>
         <section role="tabpanel" data-panel="notes" class="card" hidden>
@@ -620,13 +707,14 @@ async function viewDetail(id) {
       : `<p class="muted">${cfg.aiNotes ? `Generate ${rec.kind === 'meeting' ? 'formal meeting minutes with decisions and action items' : rec.kind === 'sermon' ? 'sermon notes with scriptures, main points and application' : rec.kind === 'lecture' ? 'study notes with key concepts and review questions' : 'a summary and key points'} from the transcript.` : 'AI notes are not set up on this server yet (the administrator needs to add an Anthropic API key).'}</p>`;
     $('#ai-gen').textContent = rec.aiNotes ? '↻ Regenerate' : '✨ Generate';
     $('#ai-gen').disabled = !cfg.aiNotes || !rec.segments.length;
+    if (me().plan === 'free') api('/api/me').then(({ plan }) => { const n = $('#ai-left'); if (n) n.textContent = `${plan.aiNotes.left} of ${plan.aiNotes.limit} AI notes left this month (Free plan)`; }).catch(() => {});
     $('#ai-edit').hidden = !rec.aiNotes;
   };
   $('#ai-gen').onclick = async () => {
     if (rec.aiNotes && !confirm('Replace the current AI notes?')) return;
     const b = $('#ai-gen'); b.disabled = true; b.textContent = 'Writing notes…';
     $('#ai-body').innerHTML = '<p class="muted">✨ Reading the transcript and writing your notes. This can take up to a minute for long recordings…</p>';
-    try { rec = (await api(`/api/recordings/${rec.id}/notes`, { method: 'POST', body: {} })).recording; toast('Notes ready.'); } catch (e) { toast(e.message, true); }
+    try { rec = (await api(`/api/recordings/${rec.id}/notes`, { method: 'POST', body: {} })).recording; toast('Notes ready.'); } catch (e) { if (!e.shown) toast(e.message, true); }
     renderAi();
   };
   $('#ai-edit').onclick = () => {
@@ -651,6 +739,7 @@ async function viewDetail(id) {
   $('#d-tags').addEventListener('change', (e) => save({ tags: e.target.value.split(',') }));
   $('#export-btn').onclick = (e) => { e.stopPropagation(); $('#export-menu').hidden = !$('#export-menu').hidden; };
   document.addEventListener('click', () => { const m = $('#export-menu'); if (m) m.hidden = true; }, { signal: viewAbort.current });
+  $$('[data-locked-export]').forEach((b) => b.onclick = () => showUpgrade(`.${b.dataset.lockedExport} export is available on the Plus and Pro plans. The Free plan exports plain text.`));
   $('#print-btn').onclick = () => window.print();
   $('#share-btn').onclick = async () => {
     const text = `${rec.title}\n\n${rec.aiNotes || rec.segments.map((s) => `${rec.speakers[s.speaker]?.name || ''}: ${s.text}`).join('\n')}`;
@@ -662,7 +751,7 @@ async function viewDetail(id) {
   };
   $('#retx').onclick = async () => {
     if (rec.segments.length && !confirm('Replace the current transcript with a new AI transcription? Your speaker names will be reset.')) return;
-    try { rec = (await api(`/api/recordings/${rec.id}/transcribe`, { method: 'POST', body: {} })).recording; renderAll(); poll(); } catch (e) { toast(e.message, true); }
+    try { rec = (await api(`/api/recordings/${rec.id}/transcribe`, { method: 'POST', body: {} })).recording; renderAll(); poll(); } catch (e) { if (!e.shown) toast(e.message, true); }
   };
 
   // ---- translation tab (Live Translation add-on) ----
@@ -708,7 +797,7 @@ async function viewDetail(id) {
       const { translation } = await api(`/api/recordings/${rec.id}/translations`, { method: 'POST', body: { lang: trLang, what: b.dataset.trdo } });
       translations = [translation, ...translations.filter((x) => x.lang !== translation.lang)];
       toast('Translation ready.');
-    } catch (err) { toast(err.message, true); b.textContent = label; b.disabled = false; return; }
+    } catch (err) { if (!err.shown) toast(err.message, true); b.textContent = label; b.disabled = false; return; }
     renderTranslate();
   });
 
@@ -750,7 +839,7 @@ async function viewAccount() {
     </div>
     <div class="card stack" style="margin-top:16px">
       <h2>Plan</h2>
-      <div class="row spread"><span><span class="chip on">Free beta</span>${user.addons.includes('translation') ? ' <span class="chip on">🌐 Live Translation</span>' : ''}</span><a class="btn sm" href="#/plans">Plans &amp; add-ons</a></div>
+      <div class="row spread"><span><span class="chip on">${esc(user.planName)}${user.planInterval ? ` · ${user.planInterval === 'year' ? 'yearly' : 'monthly'}` : ''}</span></span><a class="btn sm" href="#/plans">Change plan</a></div>
       <div class="small muted">${usage.recordings} recordings · ${usage.minutes} minutes · ${(usage.bytes / 1048576).toFixed(1)} MB stored</div>
     </div>
     <div class="card stack" style="margin-top:16px">
@@ -775,32 +864,72 @@ async function viewAccount() {
 }
 
 // ---------------- plans ----------------
-async function viewPlans() {
-  const { addons, testMode } = await api('/api/billing/plans');
-  main.innerHTML = `<div class="container" style="max-width:860px">
-    <h1>Plans &amp; add-ons</h1>
-    ${testMode ? '<div class="banner warn">Test mode: no payment is taken. Use the buttons below to switch add-ons on and off while testing.</div>' : ''}
-    <div class="plans">
-      <div class="card stack"><h2>Free beta</h2><div class="price">Free</div>
-        <ul class="ticks"><li>Unlimited recordings during beta</li><li>Transcripts with speakers and voice detection</li><li>AI sermon notes and meeting minutes</li><li>Export and share</li></ul>
-        <span class="chip on">Current plan</span></div>
-      ${addons.map((a) => `<div class="card stack plan-pro">
-        <div class="row"><span class="badge-pro">ADD-ON</span><h2 style="margin:0">🌐 ${esc(a.name)}</h2></div>
-        <div class="price">${esc(a.price)}</div>
-        <ul class="ticks">${a.features.map((f) => `<li>${esc(f)}</li>`).join('')}</ul>
-        ${a.active
-          ? `<span class="chip on">✓ Active</span>${testMode ? `<button class="btn sm" data-addon="${a.id}" data-act="cancel">Cancel (test)</button>` : ''}`
-          : testMode ? `<button class="btn primary" data-addon="${a.id}" data-act="activate">Activate (test mode – free)</button>` : '<button class="btn primary" disabled>Online payment coming soon</button>'}
-      </div>`).join('')}
+const hrs = (sec) => (sec == null ? 'Unlimited' : sec > 3600 ? `${Math.round(sec / 360) / 10} hours` : `${Math.round(sec / 60)} minutes`);
+function planFeatures(p) {
+  const L = p.limits, f = [];
+  if (p.id === 'free') {
+    f.push(`1 recording every 24 hours, up to ${hrs(L.maxRecordingSec)}`, `${Math.round(L.recordingSecPerMonth / 60)} recording minutes a month`,
+      'Live browser transcript with male/female voice labels', `AI speaker detection for imported files (${hrs(L.aiTranscriptionSecPerMonth)} a month)`,
+      `${L.aiNotesPerMonth} AI notes or minutes a month`, 'Plain-text export');
+  } else {
+    f.push(`Unlimited recordings (fair use ${hrs(L.recordingSecPerMonth)} a month)`, `Up to ${hrs(L.maxRecordingSec)} per recording`,
+      'AI transcript with speaker detection', 'Male/female voice labels', 'Unlimited AI sermon notes & meeting minutes', 'Export to Markdown, text and subtitles');
+    if (p.features.translation) f.push(`🌐 Live translation, ${Math.round(L.translationCharsPerMonth / 900 / 60)} hours a month`, '🌐 Conversation interpreter with read-aloud', '🌐 Notes & minutes in your language, 30+ languages');
+  }
+  const keepText = p.retention.textDays == null ? 'kept until you delete them' : `kept ${Math.round(p.retention.textDays / 30)} months`;
+  f.push(`Audio kept ${p.retention.audioDays >= 365 ? '12 months' : `${Math.round(p.retention.audioDays / 30)} month${p.retention.audioDays > 31 ? 's' : ''}`}`, `Notes & transcripts ${keepText}`);
+  return f;
+}
+
+async function viewPlans(interval) {
+  const { plans, current, testMode, usage } = await api('/api/billing/plans');
+  interval = interval || current.interval || 'month';
+  const cur = state.config.currency || 'US$';
+  const order = { free: 0, plus: 1, pro: 2 };
+  const R = usage.recording;
+  main.innerHTML = `<div class="container" style="max-width:1040px">
+    <div class="row spread"><h1>Plans</h1>
+      <div class="row" role="radiogroup" aria-label="Billing period">
+        <button class="chip ${interval === 'month' ? 'on' : ''}" data-interval="month">Monthly</button>
+        <button class="chip ${interval === 'year' ? 'on' : ''}" data-interval="year">Yearly · 3 months free</button></div></div>
+    ${testMode ? '<div class="banner warn">Test mode: no payment is taken. Use the buttons to switch plans while testing.</div>' : ''}
+    <div class="plans">${plans.map((p) => {
+      const isCur = p.id === current.plan;
+      const price = p.price[interval];
+      const per = interval === 'year' ? '/year' : '/month';
+      let action;
+      if (isCur && (p.id === 'free' || current.interval === interval)) action = '<span class="chip on">✓ Your plan</span>';
+      else if (!testMode) action = '<button class="btn primary" disabled>Online payment coming soon</button>';
+      else if (p.id === 'free') action = '<button class="btn" data-plan="free">Downgrade to Free</button>';
+      else action = `<button class="btn ${order[p.id] > order[current.plan] ? 'primary' : ''}" data-plan="${p.id}">${isCur ? `Switch to ${interval === 'year' ? 'yearly' : 'monthly'}` : order[p.id] > order[current.plan] ? `Upgrade to ${esc(p.name)}` : `Switch to ${esc(p.name)}`}${testMode ? ' (test)' : ''}</button>`;
+      return `<div class="card stack plan ${p.id === 'pro' ? 'plan-pro' : ''} ${isCur ? 'plan-current' : ''}">
+        <div class="row spread"><h2 style="margin:0">${esc(p.name)}</h2>${p.id === 'pro' ? '<span class="badge-pro">BEST VALUE</span>' : ''}</div>
+        <div class="small muted">${esc(p.tagline)}</div>
+        <div class="price">${price ? `${esc(cur)}${price}<span class="small muted">${per}</span>` : 'Free'}</div>
+        ${price && interval === 'year' ? `<div class="small muted">≈ ${esc(cur)}${(price / 12).toFixed(2)} a month</div>` : ''}
+        <ul class="ticks">${planFeatures(p).map((f) => `<li>${esc(f)}</li>`).join('')}</ul>
+        <div class="plan-action">${action}</div>
+      </div>`;
+    }).join('')}</div>
+    <div class="card stack" style="margin-top:16px"><h2>Your usage this month</h2>
+      <div class="usage-grid">
+        ${meter(ceilMin(R.usedSec), Math.round(R.limitSec / 60), 'Recording minutes')}
+        ${meter(usage.aiNotes.used, usage.aiNotes.limit, 'AI notes & minutes')}
+        ${meter(ceilMin(usage.aiTranscription.usedSec), Math.round(usage.aiTranscription.limitSec / 60), 'AI speaker-detection minutes')}
+        ${usage.translation.enabled ? meter(usage.translation.usedMin, usage.translation.limitMin, 'Translation minutes') : ''}
+      </div>
+      <p class="small muted">Usage resets on ${esc(fmtDay(usage.periodEnd))}. Deleting a recording does not give back its minutes. If you downgrade, you get at least 7 days to export anything the new plan no longer keeps.</p>
     </div></div>`;
   main.addEventListener('click', async (e) => {
-    const b = e.target.closest('[data-addon]'); if (!b) return;
+    const iv = e.target.closest('[data-interval]'); if (iv) return viewPlans(iv.dataset.interval);
+    const b = e.target.closest('[data-plan]'); if (!b) return;
+    if (b.dataset.plan === 'free' && !confirm('Downgrade to Free? Audio older than 30 days and notes older than 12 months will be deleted after 7 days.')) return;
     b.disabled = true;
     try {
-      const { user } = await api(`/api/billing/test/${b.dataset.act}`, { method: 'POST', body: { addon: b.dataset.addon } });
+      const { user } = await api('/api/billing/test/subscribe', { method: 'POST', body: { plan: b.dataset.plan, interval } });
       state.auth = { ...state.auth, user };
-      toast(b.dataset.act === 'activate' ? 'Live Translation activated.' : 'Add-on cancelled.');
-      viewPlans();
+      toast(`You're now on ${user.planName}${user.planInterval ? ` (${user.planInterval}ly)` : ''}.`);
+      viewPlans(interval);
     } catch (err) { toast(err.message, true); b.disabled = false; }
   }, { signal: viewAbort.current });
 }

@@ -14,6 +14,7 @@ async function signIn(email) {
 }
 async function upload(c, extra = {}) {
   const form = new FormData();
+  form.append('durationSec', '6');
   form.append('title', '日曜礼拝');
   form.append('kind', 'sermon');
   form.append('language', 'ja-JP');
@@ -32,7 +33,7 @@ test('config exposes translation in demo mode', async () => {
   assert.equal(r.data.billingTestMode, true);
 });
 
-test('translation is locked (402) for users without the add-on', async () => {
+test('translation is locked (402) for Free and Plus users', async () => {
   const c = await signIn('free@example.com');
   const live = await c.post('/api/translate/live', { texts: ['こんにちは'], source: 'ja', target: 'en' });
   assert.equal(live.status, 402);
@@ -40,7 +41,9 @@ test('translation is locked (402) for users without the add-on', async () => {
   const rec = await upload(c);
   assert.equal((await c.post(`/api/recordings/${rec.id}/translations`, { lang: 'en', what: 'transcript' })).status, 402);
   assert.equal((await c.get(`/api/recordings/${rec.id}/export?format=md&lang=en`)).status, 402);
-  // live translations sent with an upload are ignored for free users
+  // Plus does not include translation either; live translations sent with an upload are ignored
+  await c.post('/api/billing/test/subscribe', { plan: 'plus' });
+  assert.equal((await c.post('/api/translate/live', { texts: ['x'], target: 'en' })).status, 402);
   const rec2 = await upload(c, { liveTranslation: JSON.stringify({ lang: 'en', texts: ['a', 'b'] }) });
   assert.deepEqual((await c.get(`/api/recordings/${rec2.id}/translations`)).data.translations, []);
 });
@@ -52,13 +55,15 @@ test('preferred language can be set and validated', async () => {
   assert.equal((await c.patch('/api/me', { preferredLang: '<script>' })).status, 400);
 });
 
-test('paid user: activate add-on, live translate, translate transcript/notes, export, cancel', async () => {
+test('Pro user: live translate, translate transcript/notes, export, then downgrade', async () => {
   const c = await signIn('paid@example.com');
   const plans = await c.get('/api/billing/plans');
-  assert.equal(plans.data.addons[0].id, 'translation');
-  assert.equal(plans.data.addons[0].active, false);
-  const act = await c.post('/api/billing/test/activate', { addon: 'translation' });
-  assert.deepEqual(act.data.user.addons, ['translation']);
+  assert.deepEqual(plans.data.plans.map((p) => [p.id, p.price.month, p.price.year]), [['free', 0, 0], ['plus', 4, 36], ['pro', 8, 72]]);
+  assert.equal(plans.data.current.plan, 'free');
+  const act = await c.post('/api/billing/test/subscribe', { plan: 'pro', interval: 'year' });
+  assert.equal(act.data.user.plan, 'pro');
+  assert.equal(act.data.user.planInterval, 'year');
+  assert.equal(act.data.user.features.translation, true);
 
   const live = await c.post('/api/translate/live', { texts: ['おはよう', '神は愛です'], source: 'ja', target: 'en', context: [] });
   assert.equal(live.status, 200);
@@ -99,7 +104,12 @@ test('paid user: activate add-on, live translate, translate transcript/notes, ex
   const other = await signIn('other2@example.com');
   assert.equal((await other.get(`/api/recordings/${rec.id}/translations`)).status, 404);
 
-  // cancelling locks it again
-  await c.post('/api/billing/test/cancel', { addon: 'translation' });
+  // translation usage is metered
+  const usage = (await c.get('/api/billing/plans')).data.usage.translation;
+  assert.ok(usage.usedChars > 0);
+  assert.equal(usage.limitMin, 15 * 60);
+
+  // downgrading to Free locks it again
+  await c.post('/api/billing/test/subscribe', { plan: 'free' });
   assert.equal((await c.post('/api/translate/live', { texts: ['x'], target: 'en' })).status, 402);
 });

@@ -76,7 +76,22 @@ CREATE INDEX IF NOT EXISTS idx_rec_user ON recordings(user_id, created_at DESC);
 const cols = (t) => db.prepare(`PRAGMA table_info(${t})`).all().map((c) => c.name);
 if (!cols('users').includes('preferred_lang')) db.exec("ALTER TABLE users ADD COLUMN preferred_lang TEXT NOT NULL DEFAULT 'en'");
 if (!cols('users').includes('addons')) db.exec("ALTER TABLE users ADD COLUMN addons TEXT NOT NULL DEFAULT ''");
+if (!cols('users').includes('plan_interval')) db.exec("ALTER TABLE users ADD COLUMN plan_interval TEXT");
+if (!cols('users').includes('plan_changed_at')) db.exec('ALTER TABLE users ADD COLUMN plan_changed_at INTEGER');
+for (const c of ['audio_deleted_at', 'warned_audio_at', 'warned_text_at']) {
+  if (!cols('recordings').includes(c)) db.exec(`ALTER TABLE recordings ADD COLUMN ${c} INTEGER`);
+}
+// the old "translation" add-on is now part of the Pro plan
+db.exec("UPDATE users SET plan = 'pro', addons = '' WHERE addons LIKE '%translation%'");
 db.exec(`
+CREATE TABLE IF NOT EXISTS usage_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  amount INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_usage ON usage_events(user_id, kind, created_at);
 CREATE TABLE IF NOT EXISTS translations (
   recording_id TEXT NOT NULL REFERENCES recordings(id) ON DELETE CASCADE,
   lang TEXT NOT NULL,
@@ -93,10 +108,14 @@ CREATE TABLE IF NOT EXISTS billing_events (
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   type TEXT NOT NULL,
   addon TEXT,
+  plan TEXT,
+  interval TEXT,
   test INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL
 );
 `);
+
+for (const c of ['plan', 'interval']) if (!cols('billing_events').includes(c)) db.exec(`ALTER TABLE billing_events ADD COLUMN ${c} TEXT`);
 
 export const now = () => Date.now();
 export const newId = () => crypto.randomUUID();

@@ -51,7 +51,7 @@ export const config = {
   billing: {
     // Lets users switch paid add-ons on/off without paying, for testing. Never enable in production.
     testMode: env('BILLING_TEST_MODE', isProd ? 'false' : 'true') === 'true',
-    translationPrice: env('TRANSLATION_PRICE_LABEL', 'US$4.99 / month'),
+    currency: env('PRICE_CURRENCY', 'US$'),
   },
   translation: {
     // claude | mock ("mock" returns labelled demo text so the flow can be tested without an AI key)

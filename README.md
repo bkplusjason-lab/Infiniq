@@ -19,7 +19,7 @@ Infiniq is a web app that records sermons, lectures and meetings, transcribes th
 | **AI notes** (Claude) | Sermons: scriptures, main points, quotes, application, prayer points. Lectures: key concepts, detailed notes, review questions. Meetings: attendees, decisions, and an action-item table with owners. |
 | **Library** | Search across titles, transcripts and notes. Filter by type, add tags, and see usage stats. |
 | **Export** | Markdown, text, SRT/VTT subtitles, the original audio, Print or Save as PDF, and Share (on phones). |
-| **🌐 Live Translation** (paid add-on) | Captions translated in real time while recording, plus a stand-alone **Live translate** screen. That screen has a *Listen* mode for sermons, lectures and music, and a two-way *Conversation* interpreter with read-aloud. You can also translate saved transcripts into 30+ languages, have sermon notes and meeting minutes written directly in your preferred language, translate your own notes, and export translated transcripts and subtitles. |
+| **🌐 Live Translation** (Pro plan) | Captions translated in real time while recording, plus a stand-alone **Live translate** screen. That screen has a *Listen* mode for sermons, lectures and music, and a two-way *Conversation* interpreter with read-aloud. You can also translate saved transcripts into 30+ languages, have sermon notes and meeting minutes written directly in your preferred language, translate your own notes, and export translated transcripts and subtitles. |
 | **Account** | Edit your profile, see your plan and usage, sign out, and permanently delete your account and data. |
 | **Installable** | Can be added to a phone's home screen (PWA manifest). Light and dark mode. |
 
@@ -37,15 +37,37 @@ npm start                 # http://localhost:3000
 
 Without a transcription key, the transcript comes from the browser's live captions. Speakers are then grouped by voice pitch, which is approximate.
 
-### Testing the paid Live Translation add-on
+## Plans
 
-1. Sign in, then open **Account → Plans & add-ons** (or the 🌐 Translate tab). Free users see an "Unlock" card, and the server refuses translation requests from them.
-2. In test mode (the default outside production), click **Activate (test mode – free)**. No payment is taken.
-3. Set **Account → Preferred language** (e.g. English).
-4. Try **🌐 Translate → Listen**: choose 日本語 Japanese → English and speak or play Japanese audio near the mic. **Conversation** mode has "They speak" and "I speak" buttons and can read translations aloud.
-5. Try **Record** with "Translate live to" ticked, then open the recording's **🌐 Translate** tab. From there you can make notes or minutes in your language, translate your own notes, or export the translation.
+| | **Free** | **Plus: US$4/month** (US$36/year) | **Pro: US$8/month** (US$72/year) |
+|---|---|---|---|
+| Recording | 1 every 24 hours, up to 60 min each, 300 min a month | Unlimited (fair use: 30 h a month), up to 4 h each | Unlimited (fair use: 50 h a month), up to 4 h each |
+| Transcript | Live browser transcript; AI speaker detection for imported files (60 min a month) | AI transcript with speakers | AI transcript with speakers |
+| Male/female voice labels | ✓ | ✓ | ✓ |
+| AI notes and minutes | 3 a month | Unlimited | Unlimited |
+| Audio kept for | 1 month | 3 months | 12 months |
+| Notes and transcripts kept for | 12 months | Until you delete them | Until you delete them |
+| Export | Plain text | All formats | All formats |
+| 🌐 Live translation | — | — | ✓ (15 hours a month) |
 
-Without `ANTHROPIC_API_KEY`, translations are labelled demo text such as "[English – demo] …". This lets you test every screen and the paywall for free. Add the key for real translations.
+How the rules work:
+- **Prices and limits** live in one file, `src/services/plans.js`. Change a number there and the Plans page, the limits and the emails all follow.
+- **Limits are enforced on the server.** The browser also stops a recording automatically when the plan's limit is reached, with a warning 2 minutes before.
+- **If a recording is refused** for going over a limit, it stays saved on the device, so the user can upgrade and then save it.
+- **Usage is counted in a separate log,** so deleting a recording doesn't give back its minutes.
+- **Monthly allowances reset on the 1st of each month (UTC).** The "1 every 24 hours" rule is counted from the last recording.
+- **Automatic deletion** runs every hour. It emails a warning **7 days before** anything is deleted and shows warnings in the library and on the recording. When the **audio** expires, the transcript and notes are kept.
+- **Changing plans:** upgrading extends how long data is kept straight away. Downgrading always leaves **at least 7 days** to export.
+
+### Testing plans and translation
+
+1. Sign in. A new account starts on **Free**, and the library shows your usage.
+2. Make one recording. Trying a second one shows "Recording limit reached" with the time you can record again. Locked export formats open an upgrade pop-up.
+3. Open **Account → Change plan** (or **See plans**). In test mode, the default outside production, the buttons switch plans instantly and take no payment. There's a Monthly/Yearly switch.
+4. On **Pro**, try **🌐 Translate → Listen** (e.g. 日本語 Japanese → English), or **Conversation** mode with read-aloud. Also try **Record** with "Translate live to" ticked, then the recording's **🌐 Translate** tab.
+5. To see deletion warnings without waiting a month, the automated tests (`test/plans.test.js`) backdate recordings and run the deletion job.
+
+Without `ANTHROPIC_API_KEY`, translations are labelled demo text such as "[English – demo] …". This lets you test every screen and limit for free.
 
 ### Tests
 
@@ -64,7 +86,7 @@ npm run test:e2e  # real browser: sign in → record from a simulated mic → ch
 | Official emails | Any SMTP service: Google Workspace, SendGrid, Mailgun, Amazon SES, and others. Send from your own domain with SPF/DKIM set up so emails don't land in spam. | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `MAIL_FROM` |
 | Speaker detection | AssemblyAI **or** Deepgram API key | `ASSEMBLYAI_API_KEY` or `DEEPGRAM_API_KEY` |
 | AI notes + translation | console.anthropic.com | `ANTHROPIC_API_KEY` (optional: `CLAUDE_TRANSLATE_MODEL` for a faster live-caption model) |
-| Paid add-on | Set your price and turn off test mode once real payments are connected | `TRANSLATION_PRICE_LABEL`, `BILLING_TEST_MODE=false` |
+| Plans | Prices and limits are set in `src/services/plans.js`. Turn off test mode once real payments are connected. | `PRICE_CURRENCY`, `BILLING_TEST_MODE=false` |
 
 Also set `NODE_ENV=production`, `APP_URL=https://your-domain`, and a long random `SESSION_SECRET`. Serve the site over **HTTPS**, because browsers only allow microphone access on secure sites.
 
@@ -82,7 +104,9 @@ src/
   server.js        Express server, security headers, CSRF check
   routes/auth.js   Google / Facebook / WhatsApp sign-in, codes, adding an email
   routes/recordings.js  Upload, transcript, speakers, notes, export, account
-  routes/translate.js   Paid add-on: plans (test mode), live translation, transcript/notes translation
+  routes/translate.js   Plans and billing (test mode), live translation, transcript/notes translation
+  services/plans.js     Plan prices, limits, usage meter, storage periods
+  services/retention.js Hourly deletion job and 7-day warning emails
   services/        Email, WhatsApp, transcription (AssemblyAI/Deepgram), voices, AI notes (Claude)
 data/              SQLite database + audio files (created automatically, not committed)
 ```
@@ -93,17 +117,19 @@ data/              SQLite database + audio files (created automatically, not com
 
 ## Features you could add next
 
-1. **Subscriptions.** Use Stripe Checkout and Billing. The add-on system is ready: a Stripe webhook only needs to call `setAddon(userId, 'translation', true/false)` in `src/routes/translate.js`, and every billing change is already logged in `billing_events`.
-2. **Speaker voice profiles.** Remember "Pastor John's voice" so he is named automatically in future recordings.
-3. **Ask your recordings.** For example, "What did the pastor say about forgiveness last month?", answered by Claude across your library.
-4. **Shared workspaces.** A church, school or company team shares recordings and minutes, with roles for admin, editor and viewer.
-5. **Email minutes to attendees** with one tap, and send action-item reminders.
-6. **Calendar integration.** Name and tag meeting recordings automatically from Google or Outlook calendar events.
-7. **Faster live translation.** Server-side streaming speech recognition (e.g. Deepgram live) would add Firefox support and translate mid-sentence. Text-to-speech in a natural voice could serve as a "church headset" interpretation channel that many listeners join with a QR code.
-8. **Scripture lookup.** Link the Bible references found in sermons to the verse text.
-9. **Highlight clips.** Share a 30-second audio clip with its caption on social media or WhatsApp.
-10. **Offline mode.** Record with no internet connection and upload automatically when the connection returns.
-11. **Cloud storage.** Move audio to S3, Google Cloud Storage or R2 to scale, and add automatic backups.
-12. **Privacy and compliance.** A consent notice before recording others, plus data-retention settings for PDPA and GDPR.
-13. **Admin dashboard.** Track users, usage, errors and revenue.
-14. **Native mobile apps.** Wrap the web app with Capacitor to record reliably with the screen off.
+1. **Real payments.** Connect Stripe Checkout and Billing. A Stripe webhook only needs to call `setPlan(userId, 'plus' | 'pro' | 'free', 'month' | 'year')` in `src/routes/translate.js`. Every plan change is already logged in `billing_events`.
+2. **Church and school plans.** For example, US$49 a month for a whole congregation or class, with shared recordings and translated sermons for every member.
+3. **Local prices** in SGD or MYR (e.g. S$5 / S$10).
+4. **Speaker voice profiles.** Remember "Pastor John's voice" so he is named automatically in future recordings.
+5. **Ask your recordings.** For example, "What did the pastor say about forgiveness last month?", answered by Claude across your library.
+6. **Shared workspaces.** A church, school or company team shares recordings and minutes, with roles for admin, editor and viewer.
+7. **Email minutes to attendees** with one tap, and send action-item reminders.
+8. **Calendar integration.** Name and tag meeting recordings automatically from Google or Outlook calendar events.
+9. **Faster live translation.** Server-side streaming speech recognition (e.g. Deepgram live) would add Firefox support and translate mid-sentence. Text-to-speech in a natural voice could serve as a "church headset" interpretation channel that many listeners join with a QR code.
+10. **Scripture lookup.** Link the Bible references found in sermons to the verse text.
+11. **Highlight clips.** Share a 30-second audio clip with its caption on social media or WhatsApp.
+12. **Offline mode.** Record with no internet connection and upload automatically when the connection returns.
+13. **Cloud storage.** Move audio to S3, Google Cloud Storage or R2 to scale, and add automatic backups.
+14. **Privacy and compliance.** A consent notice before recording others, plus data-retention settings for PDPA and GDPR.
+15. **Admin dashboard.** Track users, usage, errors and revenue.
+16. **Native mobile apps.** Wrap the web app with Capacitor to record reliably with the screen off.

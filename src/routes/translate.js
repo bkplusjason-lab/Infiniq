@@ -1,9 +1,10 @@
-// Paid "Live Translation" add-on: billing (test mode), live caption translation,
+// Plans & billing (test mode), and the Pro-only translation features: live caption translation,
 // and translation of saved transcripts and notes/minutes.
 import { Router } from 'express';
 import { config } from '../config.js';
 import { db, now } from '../db.js';
-import { getUser, publicUser, hasAddon, addonsOf, rateLimit } from '../services/auth.js';
+import { getUser, publicUser, rateLimit } from '../services/auth.js';
+import { PLANS, planOf, can, usageOf, publicPlans, recordUsage, checkTranslation, sendLimit } from '../services/plans.js';
 import { requireUser } from './recordings.js';
 import {
   translateTexts, translateMarkdown, translationAvailable, isMock, languageName, sourceHash, LANG_RE,
@@ -11,70 +12,57 @@ import {
 import { generateNotes, notesAvailable } from '../services/notes.js';
 
 export const translateRouter = Router();
-export const ADDONS = {
-  translation: {
-    id: 'translation',
-    name: 'Live Translation',
-    price: () => config.billing.translationPrice,
-    features: [
-      'Real-time translated captions while recording sermons, lectures and meetings',
-      'Live conversation interpreter with read-aloud',
-      'Translate full transcripts into 30+ languages',
-      'Sermon notes and meeting minutes written in your preferred language',
-      'Export translated transcripts and subtitles',
-    ],
-  },
-};
-
 const parse = (s, d) => { try { return JSON.parse(s); } catch { return d; } };
 
-export function requireAddon(addon) {
-  return (req, res, next) => {
-    if (!hasAddon(req.user, addon)) {
-      return res.status(402).json({ error: `This feature is part of the ${ADDONS[addon].name} add-on. Upgrade in Account → Plans.`, code: 'upgrade_required', addon });
-    }
-    if (!translationAvailable()) return res.status(503).json({ error: 'Translation is not configured on the server.' });
-    next();
-  };
+function requireTranslation(req, res, next) {
+  if (!can(req.user, 'translation')) {
+    return res.status(402).json({ error: 'Live translation is part of the Pro plan. Upgrade in Account → Plans.', code: 'upgrade_required', feature: 'translation' });
+  }
+  if (!translationAvailable()) return res.status(503).json({ error: 'Translation is not configured on the server.' });
+  next();
 }
 
-// ---------------- billing ----------------
+// ---------------- plans & billing ----------------
 translateRouter.get('/api/billing/plans', requireUser, (req, res) => {
-  const active = addonsOf(req.user);
   res.json({
     testMode: config.billing.testMode,
-    addons: Object.values(ADDONS).map((a) => ({ id: a.id, name: a.name, price: a.price(), features: a.features, active: active.includes(a.id) })),
+    plans: publicPlans(),
+    current: { plan: planOf(req.user).id, interval: req.user.plan_interval || null },
+    usage: usageOf(req.user),
   });
 });
 
-function setAddon(userId, addon, on) {
-  const u = getUser(userId);
-  const set = new Set(addonsOf(u));
-  on ? set.add(addon) : set.delete(addon);
-  db.prepare('UPDATE users SET addons = ? WHERE id = ?').run([...set].join(','), userId);
-  db.prepare('INSERT INTO billing_events (user_id, type, addon, test, created_at) VALUES (?, ?, ?, 1, ?)').run(userId, on ? 'activate' : 'cancel', addon, now());
+/** Changes a user's plan. Real billing (e.g. a Stripe webhook) should call this too. */
+export function setPlan(userId, plan, interval, { test = false } = {}) {
+  db.prepare('UPDATE users SET plan = ?, plan_interval = ?, plan_changed_at = ? WHERE id = ?').run(plan, plan === 'free' ? null : interval, now(), userId);
+  // re-evaluate retention warnings under the new plan
+  db.prepare('UPDATE recordings SET warned_audio_at = NULL, warned_text_at = NULL WHERE user_id = ?').run(userId);
+  db.prepare('INSERT INTO billing_events (user_id, type, plan, interval, test, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(userId, plan === 'free' ? 'cancel' : 'subscribe', plan, interval || null, test ? 1 : 0, now());
 }
 
-// Test-mode only: lets testers switch the paid add-on on/off without paying.
-// When Stripe (or similar) is added, its webhook calls setAddon() instead.
-translateRouter.post('/api/billing/test/:action', requireUser, (req, res) => {
+// Test mode only: switch plans without paying.
+translateRouter.post('/api/billing/test/subscribe', requireUser, (req, res) => {
   if (!config.billing.testMode) return res.status(404).json({ error: 'Not available' });
-  const addon = req.body?.addon;
-  if (!ADDONS[addon] || !['activate', 'cancel'].includes(req.params.action)) return res.status(400).json({ error: 'Unknown add-on' });
-  setAddon(req.user.id, addon, req.params.action === 'activate');
+  const { plan, interval = 'month' } = req.body || {};
+  if (!PLANS[plan] || !['month', 'year'].includes(interval)) return res.status(400).json({ error: 'Unknown plan' });
+  setPlan(req.user.id, plan, interval, { test: true });
   res.json({ user: publicUser(getUser(req.user.id)) });
 });
 
 // ---------------- live translation ----------------
 const liveLimit = rateLimit({ windowMs: 60_000, max: 120, key: (req) => req.user.id });
-translateRouter.post('/api/translate/live', requireUser, requireAddon('translation'), liveLimit, async (req, res) => {
+translateRouter.post('/api/translate/live', requireUser, requireTranslation, liveLimit, async (req, res) => {
   const { texts, context, source, target } = req.body || {};
   if (!LANG_RE.test(target || '')) return res.status(400).json({ error: 'Choose a language to translate to.' });
   if (!Array.isArray(texts) || !texts.length || texts.length > 20) return res.status(400).json({ error: 'Send 1–20 lines.' });
   const clean = texts.map((t) => String(t ?? '').slice(0, 2000));
   const ctx = Array.isArray(context) ? context.slice(-4).map((t) => String(t ?? '').slice(0, 1000)) : [];
+  const chars = clean.join('').length;
+  try { checkTranslation(req.user, chars); } catch (e) { return sendLimit(res, e); }
   try {
     const translations = await translateTexts(clean, { target, source: LANG_RE.test(source || '') ? source : 'auto', context: ctx, live: true });
+    recordUsage(req.user.id, 'translation_chars', chars);
     res.json({ translations, demo: isMock() });
   } catch (e) {
     console.error('live translation failed', e.message);
@@ -103,13 +91,15 @@ translateRouter.get('/api/recordings/:id/translations', requireUser, (req, res) 
   res.json({ translations: rows.map((t) => viewTranslation(t, rec)) });
 });
 
-translateRouter.post('/api/recordings/:id/translations', requireUser, requireAddon('translation'), async (req, res) => {
+translateRouter.post('/api/recordings/:id/translations', requireUser, requireTranslation, async (req, res) => {
   const rec = ownedRec(req);
   if (!rec) return res.status(404).json({ error: 'Not found' });
   const { lang, what } = req.body || {};
   if (!LANG_RE.test(lang || '')) return res.status(400).json({ error: 'Choose a language.' });
   if (!['transcript', 'notes', 'mynotes'].includes(what)) return res.status(400).json({ error: 'Unknown item' });
   const segs = parse(rec.segments_json, []);
+  const chars = what === 'mynotes' ? (rec.notes_md || '').length : segs.reduce((n, s) => n + s.text.length, 0);
+  try { checkTranslation(req.user, chars); } catch (e) { return sendLimit(res, e); }
   const existing = db.prepare('SELECT * FROM translations WHERE recording_id = ? AND lang = ?').get(rec.id, lang);
   db.prepare('INSERT OR IGNORE INTO translations (recording_id, lang, origin, updated_at) VALUES (?, ?, ?, ?)').run(rec.id, lang, 'manual', now());
   try {
@@ -138,6 +128,7 @@ translateRouter.post('/api/recordings/:id/translations', requireUser, requireAdd
     console.error('translation failed', e.message);
     return res.status(e.status || 502).json({ error: e.status ? e.message : 'Translation failed. Please try again.' });
   }
+  recordUsage(req.user.id, 'translation_chars', chars);
   const t = db.prepare('SELECT * FROM translations WHERE recording_id = ? AND lang = ?').get(rec.id, lang);
   res.json({ translation: viewTranslation(t, rec) });
 });
@@ -151,7 +142,7 @@ translateRouter.delete('/api/recordings/:id/translations/:lang', requireUser, (r
 
 /** Saves live-caption translations captured during recording (called from the upload route). */
 export function saveLiveTranslation(user, recId, segments, live) {
-  if (!live || !hasAddon(user, 'translation') || !LANG_RE.test(live.lang || '') || !Array.isArray(live.texts)) return;
+  if (!live || !can(user, 'translation') || !LANG_RE.test(live.lang || '') || !Array.isArray(live.texts)) return;
   if (!segments.length) return;
   const texts = segments.map((_, i) => String(live.texts[i] ?? '').slice(0, 5000));
   if (!texts.some(Boolean)) return;

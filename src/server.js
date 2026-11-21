@@ -7,6 +7,7 @@ import { recRouter } from './routes/recordings.js';
 import { translateRouter } from './routes/translate.js';
 import { translationAvailable, isMock as translationIsMock } from './services/translate.js';
 import { listOutbox } from './services/outbox.js';
+import { startRetentionJob } from './services/retention.js';
 import { transcriptionAvailable } from './services/transcribe.js';
 import { notesAvailable } from './services/notes.js';
 
@@ -21,7 +22,7 @@ export function createApp() {
     res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
     res.setHeader('Permissions-Policy', 'microphone=(self), camera=(), geolocation=()');
     res.setHeader('Content-Security-Policy', [
-      "default-src 'self'", "img-src 'self' data: https:", "media-src 'self' blob:", "style-src 'self'",
+      "default-src 'self'", "img-src 'self' data: https:", "media-src 'self' blob:", "style-src 'self' 'unsafe-inline'",
       "script-src 'self'", "connect-src 'self'", "frame-ancestors 'none'", "base-uri 'self'", "form-action 'self'",
     ].join('; '));
     if (config.isProd) res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
@@ -47,6 +48,7 @@ export function createApp() {
     translation: translationAvailable(),
     translationDemo: translationIsMock(),
     billingTestMode: config.billing.testMode,
+    currency: config.billing.currency,
   }));
 
   app.use(authRouter);
@@ -70,6 +72,7 @@ export function createApp() {
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
+  startRetentionJob();
   createApp().listen(config.port, () => {
     console.log(`${config.appName} running at ${config.appUrl}`);
     if (config.devLogin) console.log(`Dev outbox (emails & WhatsApp codes): ${config.appUrl}/dev/outbox`);

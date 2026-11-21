@@ -67,6 +67,29 @@ try {
   assert.match(await page.textContent('#bookmarks'), /Key point/);
   await page.screenshot({ path: `${shots}/5-detail-mobile.png`, fullPage: true });
 
+  // Free plan: the library shows usage, and a second recording within 24 h is blocked
+  await page.goto(`${base}/#/`);
+  await page.waitForSelector('.plan-card .usage');
+  await page.screenshot({ path: `${shots}/5c-library-free-usage-mobile.png` });
+  await page.goto(`${base}/#/record`);
+  await page.waitForSelector('text=Recording limit reached');
+  await page.screenshot({ path: `${shots}/5d-free-limit-mobile.png` });
+  // free export is text only: locked formats open the upgrade pop-up
+  await page.goto(`${base}/#/`);
+  await page.click('.rec-card >> nth=0');
+  await page.click('#export-btn');
+  await page.click('[data-locked-export=md]');
+  await page.waitForSelector('dialog.upgrade[open]');
+  await page.screenshot({ path: `${shots}/5e-upgrade-dialog-mobile.png` });
+  await page.click('dialog.upgrade [value=close]');
+
+  // upgrade to Plus on the Plans page (test mode)
+  await page.goto(`${base}/#/plans`);
+  await page.waitForSelector('[data-plan=plus]');
+  await page.screenshot({ path: `${shots}/5f-plans-mobile.png`, fullPage: true });
+  await page.click('[data-plan=plus]');
+  await page.waitForSelector('.plan-current >> text=Plus');
+
   // seed a recording with a diarized-style transcript to check the transcript view
   const seededId = await page.evaluate(async () => {
     const f0 = Array.from({ length: 300 }, (_, i) => (i < 150 ? 112 : 215));
@@ -98,6 +121,9 @@ try {
   await dp.click('.rec-card >> nth=0');
   await dp.waitForSelector('.seg');
   await dp.screenshot({ path: `${shots}/7-detail-desktop.png` });
+  await dp.goto(base + '/#/plans');
+  await dp.waitForSelector('.plan-current');
+  await dp.screenshot({ path: `${shots}/9-plans-desktop.png` });
   await dp.goto(base + '/#/record');
   await dp.waitForSelector('#rec-btn');
   await dp.screenshot({ path: `${shots}/8-record-desktop.png` });
