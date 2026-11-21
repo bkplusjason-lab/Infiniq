@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import express from 'express';
 import cookieParser from 'cookie-parser';
 import { config, providers } from './config.js';
@@ -71,7 +72,8 @@ export function createApp() {
   return app;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+// Start the server when run directly (works on Windows, macOS and Linux paths)
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
   startRetentionJob();
   createApp().listen(config.port, () => {
     console.log(`${config.appName} running at ${config.appUrl}`);

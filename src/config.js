@@ -1,8 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 
-const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 if (fs.existsSync(path.join(root, '.env')) && !process.env.SKIP_DOTENV) {
   process.loadEnvFile(path.join(root, '.env'));
 }
