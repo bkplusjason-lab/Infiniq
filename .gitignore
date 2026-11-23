@@ -3,3 +3,6 @@ data/
 .env
 test-results/
 *.log
+node/
+node-v*/
+.npm-cache/
